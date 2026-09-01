@@ -1,0 +1,23 @@
+name: ulsync
+description: Entity-level last-write-wins synchronization client for Flutter apps.
+version: 0.1.0
+# Working name only; publication on pub.dev is a later-round decision.
+publish_to: none
+repository: https://github.com/ValeriusGC/ulsync-dart
+
+environment:
+  sdk: ^3.12.2
+  flutter: '>=3.44.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sqflite: ^2.4.3
+  http: ^1.6.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  # Runs store tests against real SQLite on the host without a device (later steps).
+  sqflite_common_ffi: ^2.4.2
