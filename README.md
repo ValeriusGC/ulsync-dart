@@ -2,7 +2,7 @@
 
 **Created:** 2026-09-01 14:25:15 +0500  
 **Updated:** 2026-09-03 18:07:56 +0500  
-**Version:** 3  
+**Version:** 4  
 **Document type:** readme
 
 ## What this is
@@ -98,6 +98,46 @@ application writes no conditional import for storage.
 the application forgets to scope by signed-in user, the next account on the
 same device inherits the previous user's cursor and silently misses part of its
 own feed.
+
+**Sizing.** On a developer machine, 10 000 entities occupy about 2.4 MB on disk
+and reopen in about 69 ms (`flutter test --dart-define=ULSYNC_MEASURE=true
+test/store/metadata_store_measure_test.dart`). The whole database is held in
+memory while open, so treat hundreds of thousands of entities per user as out
+of scope for this release.
+
+**Mobile and desktop.** Pass a file path under the application documents
+directory (for example via `path_provider`):
+
+```dart
+final databasePath =
+    '${(await getApplicationDocumentsDirectory()).path}/ulsync.db';
+final store = await SembastMetadataStore.open(databasePath: databasePath);
+```
+
+**Browser.** There is no file system path — pass a store name:
+
+```dart
+const databasePath = 'ulsync.db';
+final store = await SembastMetadataStore.open(databasePath: databasePath);
+```
+
+The library picks `databaseFactoryIo` or `databaseFactoryWeb` internally; the
+application writes no conditional import for storage.
+
+**Application tests.** Pass an in-memory factory explicitly:
+
+```dart
+import 'package:sembast/sembast_memory.dart';
+
+final store = await SembastMetadataStore.open(
+  databasePath: 'test.db',
+  factory: databaseFactoryMemory,
+);
+```
+
+**Browser guarantee.** The store is exercised in Chrome on every CI run
+(`flutter test --platform chrome test/store/`), not merely claimed in this
+README.
 
 ## Protocol
 
