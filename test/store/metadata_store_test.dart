@@ -231,21 +231,18 @@ void main() {
                 incoming.part,
               ].map(Uri.encodeComponent).join('|'),
             )
-            .put(
-              txn,
-              {
-                'userScope': incoming.userScope,
-                'entityType': incoming.entityType,
-                'id': incoming.id,
-                'part': incoming.part,
-                'createdAtMs': incoming.createdAtMs,
-                'lastEditedAtMs': incoming.lastEditedAtMs,
-                'revision': incoming.revision,
-                'sourceId': incoming.sourceId,
-                'schemaVersion': incoming.schemaVersion,
-                'dirty': incoming.dirty,
-              },
-            );
+            .put(txn, {
+              'userScope': incoming.userScope,
+              'entityType': incoming.entityType,
+              'id': incoming.id,
+              'part': incoming.part,
+              'createdAtMs': incoming.createdAtMs,
+              'lastEditedAtMs': incoming.lastEditedAtMs,
+              'revision': incoming.revision,
+              'sourceId': incoming.sourceId,
+              'schemaVersion': incoming.schemaVersion,
+              'dirty': incoming.dirty,
+            });
         await cursors.record('alice').put(txn, {
           'serverSeq': 20,
           'lastSyncAtMs': 600,
