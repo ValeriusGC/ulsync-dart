@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-02 21:31:28 +0500  
-**Version:** 2  
+**Updated:** 2026-09-03 18:07:56 +0500  
+**Version:** 3  
 **Document type:** readme
 
 ## What this is
@@ -17,7 +17,7 @@ without sharing a package name.
 
 - Not an identity provider — the application supplies the bearer token.
 - Not a replacement for the application's local database — the library keeps
-  its own metadata SQLite; application tables stay in the application.
+  its own metadata database, separate from the application's own storage.
 - Does not invent a custom merge for the application — round 1 is mechanical
   last-write-wins on the envelope.
 
@@ -44,12 +44,17 @@ The snippet below is the **goal of step 14**; it **does not compile** in this
 revision.
 
 ```dart
+// On the web there is no documents directory: the path is just a store name.
+final databasePath = kIsWeb
+    ? 'ulsync.db'
+    : '${(await getApplicationDocumentsDirectory()).path}/ulsync.db';
+
 final client = UlsyncClient(
   baseUrl: Uri.parse('http://10.0.2.2:8080'),
   userScope: userId,
   sourceId: deviceId,
   tokenProvider: () async => supabase.auth.currentSession?.accessToken,
-  store: await SqfliteMetadataStore.open(),
+  store: await SembastMetadataStore.open(databasePath: databasePath),
   adapters: [
     EntityAdapter<CounterOperation>(
       entityType: 'counter_operation',
@@ -66,6 +71,33 @@ await client.markChanged(entityType: 'counter_operation', id: opId);
 final result = await client.syncOnce();
 final subscription = client.live().listen(/* ... */);
 ```
+
+## Local metadata
+
+The library keeps a **separate** sembast database file for sync metadata only.
+Application tables and migrations are never touched.
+
+**What is stored:** creation and edit timestamps, revision number, originating
+`source_id`, schema version, a pending-push (`dirty`) flag, and the server feed
+cursor per `userScope`.
+
+**What is not stored:** entity payloads (the application adapter supplies
+content at push time), bearer tokens, or any user identifier beyond the
+`userScope` string the application passes in.
+
+**Path vs implementation.** The application supplies `databasePath` — a file
+path on mobile and desktop, a store name in the browser. The library picks the
+platform `DatabaseFactory` internally via a conditional export, so the
+application writes no conditional import for storage.
+
+**Optional `factory`.** `SembastMetadataStore.open` accepts an optional
+`factory` for **application tests only** (for example
+`databaseFactoryMemory`). It is not how production code selects a platform.
+
+**`userScope` is mandatory.** Cursor and entity keys include `userScope`. If
+the application forgets to scope by signed-in user, the next account on the
+same device inherits the previous user's cursor and silently misses part of its
+own feed.
 
 ## Protocol
 
