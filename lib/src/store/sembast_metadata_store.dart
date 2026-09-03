@@ -32,12 +32,7 @@ String _entityKey({
   required String entityType,
   required String id,
   required String part,
-}) => [
-  userScope,
-  entityType,
-  id,
-  part,
-].map(Uri.encodeComponent).join('|');
+}) => [userScope, entityType, id, part].map(Uri.encodeComponent).join('|');
 
 /// Storage key derived from [state]'s identifying fields.
 String _entityKeyOf(EntityState state) => _entityKey(
@@ -236,9 +231,7 @@ final class SembastMetadataStore {
   /// Returns `false` when [serverSeq] is not greater than what is already
   /// stored; the cursor never moves backwards.
   Future<bool> writeCursor(String userScope, int serverSeq, int atMs) =>
-      _db.transaction(
-        (txn) => _writeCursorIn(txn, userScope, serverSeq, atMs),
-      );
+      _db.transaction((txn) => _writeCursorIn(txn, userScope, serverSeq, atMs));
 
   /// Moves the cursor forward inside an existing transaction.
   ///
