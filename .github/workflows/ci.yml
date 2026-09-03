@@ -21,3 +21,4 @@ jobs:
       - run: dart format --output=none --set-exit-if-changed .
       - run: dart analyze --fatal-infos
       - run: flutter test
+      - run: flutter test --platform chrome test/store/
