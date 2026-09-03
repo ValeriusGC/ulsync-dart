@@ -8,3 +8,5 @@ library;
 
 export 'src/protocol/envelope.dart' show Envelope;
 export 'src/protocol/errors.dart' show UlsyncProtocolException;
+export 'src/store/entity_state.dart' show EntityState;
+export 'src/store/sembast_metadata_store.dart' show SembastMetadataStore;
