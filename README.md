@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-01 14:25:15 +0500  
-**Version:** 1  
+**Updated:** 2026-09-02 21:31:28 +0500  
+**Version:** 2  
 **Document type:** readme
 
 ## What this is
@@ -81,6 +81,29 @@ git submodule update --init
 
 Fixtures under `protocol/` are part of the contract — do not copy them into
 `test/`.
+
+## Wire format
+
+The envelope shape is defined in [`protocol/SPEC.md`](protocol/SPEC.md) and
+the upstream repository
+[ulsync-protocol](https://github.com/ValeriusGC/ulsync-protocol). This
+package serializes envelopes by hand — no code generation.
+
+**Base64 alphabet.** The `payload` field on the wire is a string encoded with
+RFC 4648 section 4 (standard alphabet with `+`, `/`, and `=` padding). Use
+`base64Encode` and `base64Decode` from `dart:convert`. Do **not** use the URL
+alphabet (`base64UrlEncode` / `base64UrlDecode`): Go's server uses
+`StdEncoding`, and the mismatch only shows up on bytes that contain `+` or
+`/`. See `protocol/fixtures/envelope/non_utf8_payload.json` for a fixture that
+fails if the wrong alphabet is chosen.
+
+**Fields absent from the wire JSON.** `user_id` never appears in an envelope;
+the owner comes from the bearer token. `server_seq` is present on pull and live
+responses but omitted when pushing (`null` means the key is absent in
+`toJson`, not `"server_seq": null`).
+
+**Forward compatibility.** Unknown JSON keys are ignored (SPEC section 6) so the
+server can add fields without breaking existing clients.
 
 ## Development
 
