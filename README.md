@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 10:04:59 +0500  
-**Version:** 6  
+**Updated:** 2026-09-04 17:22:29 +0500  
+**Version:** 7  
 **Document type:** readme
 
 ## What this is
@@ -38,12 +38,19 @@ dependencies:
 
 Do not run `flutter pub add ulsync` — the package is not on pub.dev.
 
-## Minimal setup
+## Getting started
 
-The snippet below is the **goal of step 14**; it **does not compile** in this
-revision.
+The application talks to four types: `UlsyncClient`, `EntityAdapter`,
+`SyncReport`, and `SyncEvent`. Cursor, send queue, last-write-wins, retries
+of a dropped live socket, and the wire format stay inside the library.
 
 ```dart
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:ulsync/ulsync.dart';
+
 // On the web there is no documents directory: the path is just a store name.
 final databasePath = kIsWeb
     ? 'ulsync.db'
@@ -69,8 +76,101 @@ final client = UlsyncClient(
 
 await client.markChanged(entityType: 'counter_operation', id: opId);
 final result = await client.syncOnce();
-final subscription = client.live().listen(/* ... */);
+final subscription = client.live().listen((event) {
+  // Update the screen from SyncEvent. Do not parse envelopes.
+});
 ```
+
+`10.0.2.2` is the host loopback as seen from an Android emulator. On a
+macOS or iOS simulator use `http://127.0.0.1:8080`. The `example/` app
+reads the same values from `--dart-define` so it is not an identity
+provider.
+
+**`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
+prefixes such as `/api` are not supported; requests always go to
+`/v1/sync/push` and `/v1/sync/pull`. Ignored when a test supplies
+`transport`, but still required so production and tests share one
+constructor.
+
+**`userScope`.** The signed-in user. It is part of every metadata key. A
+different account on the same device must not inherit the previous
+cursor — that would silently skip part of the new user's feed. Pass a
+new `UlsyncClient` (or a new `userScope` on a fresh client) after
+sign-in; do not "reset on sign-out" as a best-effort extra call.
+
+**`sourceId`.** Stable installation id, written to envelope `source_id`.
+It is the third last-write-wins rank when edit time and revision tie.
+The library never invents it: only the application knows what counts as
+a device and only the application can persist it across launches.
+
+**`tokenProvider`.** Called before every HTTP request, including the
+one-time 401 retry. Return the current access token, or `null` / blank
+to fail fast with `UlsyncUnauthorized` and no network call. The library
+does not refresh sessions; it re-reads whatever the application now
+holds.
+
+**`store`.** The library's metadata database (cursor, dirty queue,
+revision). The application chooses the path; the library chooses the
+sembast factory for the platform. See **Local metadata** below. Entity
+payloads are **not** copied here — `load` reads them from the
+application store at push time.
+
+**`adapters`.** One `EntityAdapter<T>` per `entity_type` the application
+understands. Duplicate types throw at construction. A type that arrives
+from the server with no adapter is skipped, the cursor still advances,
+and `SyncUnknownType` is emitted — a foreign type must not stop sync of
+the types you do own.
+
+**`apply` must be idempotent.** The application store and the metadata
+database are different databases. There is no transaction that covers
+both. The engine therefore writes the application store first
+(`decode` + `apply`) and only then persists metadata and the cursor. If
+the process dies between those two writes, the next pull or live event
+delivers the same envelope again and `apply` runs a second time. An
+upsert by `id` is safe; an append without dedup duplicates the record.
+The opposite order (cursor first) would skip the record forever after
+the same crash, so the engine does not use it.
+
+Call `markChanged` after every local edit. The engine, not the
+application, increments `revision`. Then call `syncOnce` when the
+application decides it is a good time (foreground, not low battery).
+The library does **not** start a timer.
+
+Listen to `live()` for `SyncEvent` values:
+
+- `SyncApplied` / `SyncCursorAdvanced` — refresh the screen from the
+  application store; the payload is already in `apply`.
+- `SyncConnectionLost` — show a disconnected state. Do not parse the
+  protocol. The library reopens the feed on its own.
+- `SyncConnectionRestored` — clear that state. After returning from
+  background, still call `syncOnce`: the OS may have killed the socket
+  in a way that looks like a clean close (see Limitations).
+- `SyncUnknownType` — log it; sync of known types continues.
+
+The application does not store the cursor or the send queue. Those live
+in `SembastMetadataStore`.
+
+## Limitations of round 1
+
+- One envelope per `POST /v1/sync/push`. The dirty queue is already a
+  list; round 2 changes the **body** of the push loop, not the queue.
+- No deletion, no tombstones, no `part` other than `full`.
+- No payload compression, no clock-skew correction, no content schema
+  migrations inside the library.
+- The library does not call `syncOnce` on a timer. The application knows
+  foreground, battery, and connectivity.
+- `syncOnce` does not retry HTTP `5xx` or network errors. It throws and
+  leaves `dirty` set so the application can call `syncOnce` again.
+- `applied: false` is success: the server already holds a row that is
+  not inferior. The engine clears `dirty` on both `true` and `false`.
+  Retrying a rejected envelope loops forever because the upsert requires
+  a strictly superior tuple.
+- A live socket closed by the OS in the background is caught up by an
+  ordinary `syncOnce` when the application returns to the foreground.
+  That is the same limit PowerSync and PocketBase document.
+- The `example/` app is not promised against a local server from Chrome:
+  `ulsync-server` does not send CORS headers. Use macOS or an Android
+  emulator.
 
 ## Local metadata
 
@@ -199,7 +299,7 @@ data. A server heartbeat that nobody watches is traffic without a diagnosis.
 The watchdog is reset on every byte of the response body, including a partial
 UTF-8 chunk, not only on a parsed event.
 
-Failures are typed so the engine (step 14) can decide retry versus stop:
+Failures are typed so `UlsyncClient.syncOnce` can decide retry versus stop:
 
 - `UlsyncNetworkException` and `UlsyncServerException` (HTTP 5xx) are
   retryable. `push` and `pull` do **not** retry them; they throw and leave
@@ -236,10 +336,10 @@ JSON field; it does **not** verify the signature — the server does that when
 the stream opens. If `exp` cannot be read, the feed is reopened every 30
 minutes rather than immediately or never.
 
-Cleartext HTTP (`http://`) on Android is blocked by default. Enabling it
-(`android:usesCleartextTraffic` or a network-security config) is an
-**application** setting (step 15), not something this library turns on. The
-package does not ship an Android manifest and will not add one.
+Cleartext HTTP (`http://`) on Android is blocked by default. The example
+enables it only in the **debug** manifest
+(`android:usesCleartextTraffic="true"`). Production apps that talk HTTP
+must set this themselves; the library does not ship an Android manifest.
 
 ## Development
 

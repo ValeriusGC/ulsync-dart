@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 10:04:59 +0500  
-**Version:** 5  
+**Updated:** 2026-09-04 17:22:29 +0500  
+**Version:** 6  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Sync engine (`UlsyncClient`, `EntityAdapter`, `SyncReport`, `SyncEvent`):
+  dirty queue, last-write-wins apply, live feed, internal lock.
 - HTTP transport (`HttpSyncTransport`, `SyncTransport`): push, pull, and a
   live Server-Sent Events feed.
 - Typed transport failures split by whether the caller should retry
