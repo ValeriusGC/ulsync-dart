@@ -1,20 +1,25 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 10:04:59 +0500  
-**Version:** 5  
+**Updated:** 2026-09-04 17:41:40 +0500  
+**Version:** 7  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.0] - 2026-09-04
 
 ### Added
 
+- Sync engine (`UlsyncClient`, `EntityAdapter`, `SyncReport`, `SyncEvent`):
+  dirty queue, last-write-wins apply, live feed, internal lock.
+- Example application (`example/`): one memo, `Save and sync`, live events.
 - HTTP transport (`HttpSyncTransport`, `SyncTransport`): push, pull, and a
   live Server-Sent Events feed.
+- Live connection lost/restored via `onConnectionState` on `live` (not a
+  fourth `LiveMessage`).
 - Typed transport failures split by whether the caller should retry
   (`UlsyncNetworkException`, `UlsyncServerException`, `UlsyncUnauthorized`,
   `UlsyncRequestRejected`).
@@ -27,10 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Replaced `sqflite` with `sembast` and `sembast_web` so the store runs on every
   Flutter platform, including the browser.
 - CI runs `flutter test --platform chrome test/store/` on every push to prove the
-  browser store path, not only document it.
-
-### Added (earlier)
-
+  browser store path, not only document it. CI also analyzes `example/`.
 - Package skeleton: strict analyzer, single public library file, protocol git
   submodule, CI workflow, and a test that forbids Flutter imports in the
   protocol core.

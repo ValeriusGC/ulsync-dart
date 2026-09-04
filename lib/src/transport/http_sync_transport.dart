@@ -204,7 +204,10 @@ final class HttpSyncTransport implements SyncTransport {
   /// until the first subscription is cancelled. A dropped TCP connection
   /// does not complete the returned stream.
   @override
-  Stream<LiveMessage> live({required int Function() appliedSince}) {
+  Stream<LiveMessage> live({
+    required int Function() appliedSince,
+    void Function(LiveConnectionState state)? onConnectionState,
+  }) {
     _ensureOpen();
     if (_liveSession != null) {
       throw StateError('HttpSyncTransport already has a live stream');
@@ -239,6 +242,7 @@ final class HttpSyncTransport implements SyncTransport {
           _liveSession = null;
         }
       },
+      onConnectionState: onConnectionState,
     );
     _liveSession = session;
     return controller.stream;
