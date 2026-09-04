@@ -49,6 +49,7 @@ final class LiveSession {
     required this._backoffDelay,
     required this._isTransportClosed,
     required this._onStopped,
+    this.onConnectionState,
   });
 
   /// Shared HTTP client; not owned (the transport closes it).
@@ -90,6 +91,10 @@ final class LiveSession {
 
   /// Clears the transport's live slot; must be idempotent.
   final void Function() _onStopped;
+
+  /// Engine callback for drop/restore. `null` in tests that only watch
+  /// [LiveMessage]. JWT `exp` reopen does not call this.
+  final void Function(LiveConnectionState state)? onConnectionState;
 
   /// Set by [stop] and by a terminal failure.
   bool _stopped = false;
@@ -179,12 +184,14 @@ final class LiveSession {
           if (_halted) {
             return;
           }
+          _emitConnection(LiveConnectionState.lost);
           await _backoffAfterFailure();
           break headerAttempt;
         } on http.ClientException {
           if (_halted) {
             return;
           }
+          _emitConnection(LiveConnectionState.lost);
           await _backoffAfterFailure();
           break headerAttempt;
         } catch (e) {
@@ -195,6 +202,7 @@ final class LiveSession {
             _fail(e);
             return;
           }
+          _emitConnection(LiveConnectionState.lost);
           await _backoffAfterFailure();
           break headerAttempt;
         }
@@ -243,10 +251,12 @@ final class LiveSession {
           if (_halted) {
             return;
           }
+          _emitConnection(LiveConnectionState.lost);
           await _backoffAfterFailure();
           break headerAttempt;
         }
 
+        _emitConnection(LiveConnectionState.restored);
         final connectedAt = DateTime.now();
         final end = await _consumeBody(streamed, workingToken);
         if (_halted) {
@@ -268,6 +278,9 @@ final class LiveSession {
             break headerAttempt;
           case _BodyEnd.dropped:
           case _BodyEnd.silence:
+            if (!_halted) {
+              _emitConnection(LiveConnectionState.lost);
+            }
             if (DateTime.now().difference(connectedAt) >= _stableConnection) {
               _failedAttempt = 0;
             }
@@ -469,6 +482,11 @@ final class LiveSession {
     if (!_controller.isClosed) {
       _controller.addError(error, stack);
     }
+  }
+
+  /// Forwards [state] to the engine. No-op when the callback is unset.
+  void _emitConnection(LiveConnectionState state) {
+    onConnectionState?.call(state);
   }
 
   Future<void> _drain(http.StreamedResponse response) async {

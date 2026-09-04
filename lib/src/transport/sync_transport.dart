@@ -29,10 +29,18 @@ abstract interface class SyncTransport {
   /// the engine has **applied**, not the last `cursor` event observed.
   /// The transport never stores a cursor of its own.
   ///
+  /// [onConnectionState] reports drop and restore. It is not a [LiveMessage]:
+  /// existing stream tests keep their three-kind expectations. A scheduled
+  /// reopen at JWT `exp` is **not** [LiveConnectionState.lost]; nor is
+  /// [close] or subscription cancel.
+  ///
   /// The returned stream does not complete on a dropped TCP connection.
   /// It completes on [close], on subscription cancel, or on a non-retryable
   /// failure.
-  Stream<LiveMessage> live({required int Function() appliedSince});
+  Stream<LiveMessage> live({
+    required int Function() appliedSince,
+    void Function(LiveConnectionState state)? onConnectionState,
+  });
 
   /// Cancels the live stream, closes the HTTP client, rejects later calls.
   Future<void> close();
@@ -94,11 +102,26 @@ final class PullPage {
 
 /// One item from the live Server-Sent Events feed.
 ///
-/// Three kinds, matching the wire: envelope, cursor, heartbeat. A fourth
-/// kind for "disconnected" is intentionally absent — reconnect is internal.
+/// Three kinds, matching the wire: envelope, cursor, heartbeat. Disconnect
+/// and restore are [LiveConnectionState] on [SyncTransport.live], not another
+/// [LiveMessage] subtype — stream tests from step 13 keep their expectations.
 sealed class LiveMessage {
   /// Creates a live-feed message.
   const LiveMessage();
+}
+
+/// Live TCP/HTTP session state for the engine, not a wire event.
+///
+/// A JWT `exp` reopen is scheduled and is not [lost]. Closing the transport
+/// or cancelling the subscription is also not [lost]: the application asked
+/// to stop.
+enum LiveConnectionState {
+  /// The live HTTP stream dropped, timed out, or the headers failed.
+  lost,
+
+  /// A live HTTP response with a 2xx status was received, including the
+  /// first open.
+  restored,
 }
 
 /// An `event: envelope` payload parsed as an [Envelope].
