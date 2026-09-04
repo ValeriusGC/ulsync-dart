@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 08:52:37 +0500  
-**Version:** 4  
+**Updated:** 2026-09-04 10:04:59 +0500  
+**Version:** 5  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- HTTP transport (`HttpSyncTransport`, `SyncTransport`): push, pull, and a
+  live Server-Sent Events feed.
+- Typed transport failures split by whether the caller should retry
+  (`UlsyncNetworkException`, `UlsyncServerException`, `UlsyncUnauthorized`,
+  `UlsyncRequestRejected`).
+- Live feed reconnects with a silence watchdog and jittered backoff; the
+  outward stream does not complete on a dropped socket.
+- Live feed reopens 60 seconds before JWT `exp` (the claim is read; the
+  signature is not verified). Unreadable `exp` falls back to 30 minutes.
 - Per-user metadata store on sembast (`SembastMetadataStore`, `EntityState`):
   cursor, dirty queue with conditional clear, atomic `applyIncoming`.
 - Replaced `sqflite` with `sembast` and `sembast_web` so the store runs on every
