@@ -3,9 +3,10 @@
 /// See the README for setup and the `protocol/` submodule for the wire format.
 ///
 /// Public API: [Envelope], [UlsyncProtocolException], [EntityState],
-/// [SembastMetadataStore], [SyncTransport], [PushResult], [PullPage],
-/// [LiveMessage], [LiveEnvelope], [LiveCursor], [LiveHeartbeat], and the
-/// transport failure types. Live-feed line parsing stays internal.
+/// [SembastMetadataStore], [SyncTransport], [HttpSyncTransport],
+/// [PushResult], [PullPage], [LiveMessage], [LiveEnvelope], [LiveCursor],
+/// [LiveHeartbeat], and the transport failure types. Live-feed line
+/// parsing stays internal.
 library;
 
 export 'src/protocol/envelope.dart' show Envelope;
@@ -21,6 +22,7 @@ export 'src/transport/sync_transport.dart'
         LiveEnvelope,
         LiveCursor,
         LiveHeartbeat;
+export 'src/transport/http_sync_transport.dart' show HttpSyncTransport;
 export 'src/transport/exceptions.dart'
     show
         UlsyncTransportException,

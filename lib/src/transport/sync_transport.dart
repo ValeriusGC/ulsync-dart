@@ -40,8 +40,9 @@ abstract interface class SyncTransport {
 
 /// One row from a push response (`id`, `part`, `applied`).
 ///
-/// There is no `serverSeq`: the wire omits it (SPEC sections 1.3 and 3.1).
-/// The client's cursor moves only from pull and live, never from push.
+/// There is no `server_seq` on this type: the wire omits it (SPEC sections 1.3
+/// and 3.1). The client's cursor moves only from pull and live, never from
+/// push.
 final class PushResult {
   /// Creates a result for one pushed envelope.
   const PushResult({
