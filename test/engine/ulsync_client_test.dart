@@ -181,6 +181,16 @@ Future<void> _pumpUntil(bool Function() condition, {int max = 50}) async {
   fail('condition not met after $max event-loop yields');
 }
 
+/// Whether the engine cursor, as [SyncTransport.live] would read it, is [cursor].
+///
+/// [EntityAdapter.apply] finishing is not enough: in-memory cursor moves only
+/// after metadata persist, and that await yields. Reconnect tests that wait
+/// on apply count race here under randomized package-wide order.
+bool _memoryCursorIs(_Harness h, int cursor) {
+  final read = h.fake.appliedSince;
+  return read != null && read() == cursor;
+}
+
 void main() {
   test(
     'markChanged on a new entity sets revision 1 and dirty; a second call sets 2',
@@ -518,8 +528,7 @@ void main() {
       h.fake.liveController.add(
         LiveEnvelope(_memoEnvelope(id: 'e1', serverSeq: 3, text: 'live')),
       );
-      await _pumpUntil(() => h.applies == 1);
-      await Future<void>.delayed(Duration.zero);
+      await _pumpUntil(() => _memoryCursorIs(h, 3));
       expect(h.appStore['e1'], 'live');
       expect(await h.store.readCursor('alice'), 3);
       expect(events.whereType<SyncApplied>(), isNotEmpty);
@@ -571,7 +580,7 @@ void main() {
       h.fake.liveController.add(
         LiveEnvelope(_memoEnvelope(id: 'e1', serverSeq: 8, text: 'live')),
       );
-      await _pumpUntil(() => h.applies == 1);
+      await _pumpUntil(() => _memoryCursorIs(h, 8));
       h.fake.simulateReconnect();
       expect(h.fake.appliedSinceReads, [0, 8]);
     },
