@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 08:52:37 +0500  
-**Version:** 5  
+**Updated:** 2026-09-04 10:04:59 +0500  
+**Version:** 6  
 **Document type:** readme
 
 ## What this is
@@ -176,6 +176,70 @@ responses but omitted when pushing (`null` means the key is absent in
 
 **Forward compatibility.** Unknown JSON keys are ignored (SPEC section 6) so the
 server can add fields without breaking existing clients.
+
+## Transport
+
+The library talks to the server through one `http.Client` for the lifetime of
+the transport object. Reusing the client keeps TCP and TLS connections alive
+(HTTP keep-alive). Creating a new client per request would handshake again
+every few minutes, which on a phone is both slow and expensive.
+
+`push` and `pull` wait at most 30 seconds for a complete response. The live
+feed (`GET /v1/sync/pull?live=sse`) has no overall deadline — it is meant to
+stay open. Waiting for **headers** of that request still uses the 30-second
+budget; after the stream is open, a **silence watchdog** of 45 seconds takes
+over. 45 seconds is three times the server's `live_heartbeat` (15 seconds in
+the server's `config.example.yaml`).
+
+The client must know that heartbeat period even though the server already
+writes `: ping`. A mobile carrier NAT (network address translation) closes
+idle TCP sockets without sending RST. The client's TCP stack then sits on a
+half-open connection for minutes or forever, and the application shows stale
+data. A server heartbeat that nobody watches is traffic without a diagnosis.
+The watchdog is reset on every byte of the response body, including a partial
+UTF-8 chunk, not only on a parsed event.
+
+Failures are typed so the engine (step 14) can decide retry versus stop:
+
+- `UlsyncNetworkException` and `UlsyncServerException` (HTTP 5xx) are
+  retryable. `push` and `pull` do **not** retry them; they throw and leave
+  the loop to the engine. The live feed reconnects on its own because the
+  outward stream must not complete on a dropped socket.
+- `UlsyncRequestRejected` (HTTP 4xx other than a single 401 retry) is not
+  retried: the server will give the same answer. Looping on 413 drains the
+  battery and the traffic budget.
+- `UlsyncUnauthorized` is a missing or empty token, or HTTP 401 after one
+  retry with a fresh token from `tokenProvider`.
+- `UlsyncProtocolException` means the bytes did not match the contract; it is
+  not retried.
+
+After a live disconnect, the transport waits 1 second, then 2, 4, and so on,
+up to a **base** of 30 seconds, and then adds a random delay of up to that
+same base (full jitter). Capping the *total* at 30 seconds would squeeze
+jitter to zero at the ceiling and recreate the reconnect storm that jitter
+exists to prevent. The backoff counter resets only after a connection has
+stayed up for at least one minute; a connect-and-drop loop is not treated as
+success. Round 1 does not open `live=poll`.
+
+The transport does not store a cursor. Each (re)open of the live feed calls
+`appliedSince` and sends that integer as `since`. That callback must return
+the cursor the engine has **applied**, not the last `cursor` event observed:
+reopening from a cursor that was only seen would skip the rest of a batch
+that was cut in half by a disconnect.
+
+`tokenProvider` is called before every HTTP request, including the one-time
+retry after 401, because the application may have rotated the session. An
+empty or `null` token becomes `UlsyncUnauthorized` without touching the
+network. The live feed is reopened 60 seconds before the JWT `exp` claim, so
+the new handshake still has a valid token. The client reads `exp` as an open
+JSON field; it does **not** verify the signature — the server does that when
+the stream opens. If `exp` cannot be read, the feed is reopened every 30
+minutes rather than immediately or never.
+
+Cleartext HTTP (`http://`) on Android is blocked by default. Enabling it
+(`android:usesCleartextTraffic` or a network-security config) is an
+**application** setting (step 15), not something this library turns on. The
+package does not ship an Android manifest and will not add one.
 
 ## Development
 
