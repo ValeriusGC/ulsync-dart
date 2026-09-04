@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-03 18:07:56 +0500  
-**Version:** 3  
+**Updated:** 2026-09-04 08:52:37 +0500  
+**Version:** 4  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cursor, dirty queue with conditional clear, atomic `applyIncoming`.
 - Replaced `sqflite` with `sembast` and `sembast_web` so the store runs on every
   Flutter platform, including the browser.
+- CI runs `flutter test --platform chrome test/store/` on every push to prove the
+  browser store path, not only document it.
 
 ### Added (earlier)
 
