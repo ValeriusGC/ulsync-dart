@@ -2,13 +2,23 @@
 ///
 /// See the README for setup and the `protocol/` submodule for the wire format.
 ///
-/// Public API: [Envelope], [UlsyncProtocolException], [EntityState],
-/// [SembastMetadataStore], [SyncTransport], [HttpSyncTransport],
-/// [PushResult], [PullPage], [LiveMessage], [LiveEnvelope], [LiveCursor],
-/// [LiveHeartbeat], and the transport failure types. Live-feed line
-/// parsing stays internal.
+/// Applications talk to [UlsyncClient], [EntityAdapter], [SyncReport], and
+/// [SyncEvent]. Wire envelopes are not part of the sync event stream.
+/// Live-feed line parsing stays internal.
 library;
 
+export 'src/engine/entity_adapter.dart' show EntityAdapter;
+export 'src/engine/sync_engine.dart' show UlsyncClient;
+export 'src/engine/sync_event.dart'
+    show
+        SyncEvent,
+        SyncApplied,
+        SyncedEntity,
+        SyncCursorAdvanced,
+        SyncConnectionLost,
+        SyncConnectionRestored,
+        SyncUnknownType;
+export 'src/engine/sync_report.dart' show SyncReport;
 export 'src/protocol/envelope.dart' show Envelope;
 export 'src/protocol/errors.dart' show UlsyncProtocolException;
 export 'src/store/entity_state.dart' show EntityState;
@@ -21,7 +31,8 @@ export 'src/transport/sync_transport.dart'
         LiveMessage,
         LiveEnvelope,
         LiveCursor,
-        LiveHeartbeat;
+        LiveHeartbeat,
+        LiveConnectionState;
 export 'src/transport/http_sync_transport.dart' show HttpSyncTransport;
 export 'src/transport/exceptions.dart'
     show
