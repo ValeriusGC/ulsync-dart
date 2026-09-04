@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-03 18:07:56 +0500  
-**Version:** 4  
+**Updated:** 2026-09-04 08:52:37 +0500  
+**Version:** 5  
 **Document type:** readme
 
 ## What this is
@@ -185,7 +185,11 @@ flutter pub get
 dart format --output=none --set-exit-if-changed .
 dart analyze --fatal-infos
 flutter test
+flutter test --platform chrome test/store/
 ```
+
+The Chrome run exercises the metadata store through the default platform
+factory; CI runs the same command on every push.
 
 ## License
 
