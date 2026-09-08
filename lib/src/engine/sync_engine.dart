@@ -202,6 +202,7 @@ final class UlsyncClient {
       final counters = _SyncCounters();
       await _pushDirty(counters);
       await _ensureCursorLoaded();
+      await _reconcileCursorIfAhead();
       await _pullPages(counters);
       return SyncReport(
         pushed: counters.pushed,
@@ -281,6 +282,43 @@ final class UlsyncClient {
     }
     _appliedCursor = await store.readCursor(userScope);
     _cursorLoaded = true;
+  }
+
+  /// Server feed head from paginated `pull(since: 0)`; `0` when the feed is empty.
+  Future<int> _probeFeedHead() async {
+    var since = 0;
+    while (true) {
+      _ensureOpen();
+      final page = await _transport.pull(
+        since: since,
+        limit: kPullPageLimit,
+      );
+      if (page.envelopes.length < kPullPageLimit) {
+        return page.nextCursor;
+      }
+      if (page.nextCursor <= since) {
+        return page.nextCursor;
+      }
+      since = page.nextCursor;
+    }
+  }
+
+  /// Resets local cursor when metadata is ahead of the server feed.
+  ///
+  /// After a server-side store reset, clients can keep a high sembast cursor
+  /// and skip live catch-up. The server is read-only here: replay from
+  /// `since=0` and idempotent [EntityAdapter.apply] realign the client.
+  Future<void> _reconcileCursorIfAhead() async {
+    final local = _appliedCursor;
+    if (local == 0) {
+      return;
+    }
+    final head = await _probeFeedHead();
+    if (local <= head) {
+      return;
+    }
+    await store.resetCursor(userScope);
+    _appliedCursor = 0;
   }
 
   /// Sends up to [kPushBatchLimit] dirty rows, one envelope per POST.
@@ -474,7 +512,10 @@ final class UlsyncClient {
   /// Opens the transport live feed and ingests each message under the lock.
   Future<void> _runLive() async {
     try {
-      await _serialized(_ensureCursorLoaded);
+      await _serialized(() async {
+        await _ensureCursorLoaded();
+        await _reconcileCursorIfAhead();
+      });
       if (_closed) {
         return;
       }

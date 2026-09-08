@@ -226,6 +226,15 @@ final class SembastMetadataStore {
     return stored == null ? 0 : stored['serverSeq']! as int;
   }
 
+  /// Clears the stored feed cursor for [userScope].
+  ///
+  /// Used when local metadata is ahead of the server feed (for example after
+  /// a server-side store reset). Entity rows are not deleted; the next pull
+  /// replays from the beginning and [EntityAdapter.apply] must be idempotent.
+  Future<void> resetCursor(String userScope) async {
+    await _cursors.record(userScope).delete(_db);
+  }
+
   /// Advances the cursor when [serverSeq] is greater than the stored value.
   ///
   /// Returns `false` when [serverSeq] is not greater than what is already

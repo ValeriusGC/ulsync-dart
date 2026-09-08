@@ -196,6 +196,7 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
           ),
         ],
       );
+      final report = await client.syncOnce();
       _liveSub = client.live().listen(_onLiveEvent, onError: _onLiveError);
       if (!mounted) {
         await client.close();
@@ -210,6 +211,10 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
         _events.clear();
       });
       _log('connected');
+      _log(
+        'pushed ${report.pushed}  accepted ${report.accepted}  '
+        'applied ${report.applied}  cursor ${report.cursor}',
+      );
     } catch (e) {
       await client?.close();
       if (!mounted) {

@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-08 08:31:05 +0300  
-**Version:** 8  
+**Updated:** 2026-09-08 09:55:00 +0300  
+**Version:** 9  
 **Document type:** readme
 
 ## What this is
@@ -187,6 +187,16 @@ Application tables and migrations are never touched.
 **What is stored:** creation and edit timestamps, revision number, originating
 `source_id`, schema version, a pending-push (`dirty`) flag, and the server feed
 cursor per `userScope`.
+
+**Cursor ahead of the server.** If the server store was reset or replaced while
+this metadata file survived, the local cursor can be higher than the server's
+feed head. Pull and live would then skip new rows with no error. Before each
+[`syncOnce`](lib/src/engine/sync_engine.dart) and when opening the live feed,
+the engine compares the stored cursor to the server head (via `pull(since: 0)`)
+and, when local is ahead, resets the cursor and replays from the beginning.
+The server is not modified; [`EntityAdapter.apply`](lib/src/engine/entity_adapter.dart)
+must be idempotent. Sign out and a fresh metadata file are still required when
+changing accounts (`userScope`).
 
 **What is not stored:** entity payloads (the application adapter supplies
 content at push time), bearer tokens, or any user identifier beyond the

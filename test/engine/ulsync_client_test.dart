@@ -466,6 +466,9 @@ void main() {
     expect(await h.store.readCursor('alice'), 50);
     expect(events.whereType<SyncCursorAdvanced>(), isEmpty);
     h.fake.onPull = ({required int since, int? limit}) async {
+      if (since == 0) {
+        return PullPage(envelopes: const [], nextCursor: 50);
+      }
       return PullPage(envelopes: const [], nextCursor: since);
     };
     final report = await h.client.syncOnce();
@@ -599,6 +602,32 @@ void main() {
       );
       expect(() => h.client.syncOnce(), throwsA(isA<StateError>()));
       await h.client.close();
+    },
+  );
+
+  test(
+    'syncOnce replays from since=0 when local cursor is ahead of server feed',
+    () async {
+      final h = await _Harness.open();
+      await h.store.writeCursor('alice', 18, 1000);
+      h.fake.onPull = ({required int since, int? limit}) async {
+        if (since == 0) {
+          return PullPage(
+            envelopes: [
+              for (var i = 1; i <= 9; i++)
+                _memoEnvelope(id: 'e$i', serverSeq: i, text: 't$i'),
+            ],
+            nextCursor: 9,
+          );
+        }
+        return PullPage(envelopes: const [], nextCursor: since);
+      };
+      final report = await h.client.syncOnce();
+      expect(h.applies, 9);
+      expect(report.applied, 9);
+      expect(report.cursor, 9);
+      expect(await h.store.readCursor('alice'), 9);
+      expect(h.fake.pullCalls.where((call) => call.since == 0), hasLength(2));
     },
   );
 

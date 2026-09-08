@@ -1,8 +1,8 @@
 # ulsync example
 
 **Created:** 2026-09-08 08:31:05 +0300  
-**Updated:** 2026-09-08 08:31:05 +0300  
-**Version:** 1  
+**Updated:** 2026-09-08 09:55:00 +0300  
+**Version:** 3  
 **Document type:** readme
 
 ## What this is
@@ -88,6 +88,40 @@ go run /tmp/mint_dev_jwt.go bob
 
 The `User` field in the Connect form must match the token's `sub` claim.
 
+## Clean slate before a two-window run
+
+The library keeps a **separate metadata file per Device ID** (sync cursor,
+dirty queue). The example stores them under the macOS app sandbox. Wiping
+only the server's `./data/ulsync.db` **without** deleting these files used to
+leave the client cursor **ahead** of the server — live opened with
+`since=<local cursor>` and **skipped** new envelopes (tablet stayed at `0`
+while phone showed `pushed … cursor 18`). The engine now **reconciles** on
+Connect (`syncOnce`) and before live: when local cursor is ahead of the server
+feed head, it resets and replays from the beginning. Deleting client metadata
+below is still recommended for a perfectly clean demo; it is **not** required
+for the two-window plus test after a server-only reset. **Disconnect** does
+not remove metadata; quit the app (**Cmd+Q**) first.
+
+Other files in `ulsync-server/data/` (`ulsync-load.db`, ad-hoc names) are
+**not** the operator store; only `ulsync.db` matters for this demo.
+
+```bash
+# Quit all ulsync_example.app windows first (Cmd+Q).
+
+# Server store (stop ./ulsync-server with Ctrl+C before rm)
+cd /path/to/ulsync-server
+rm -f ./data/ulsync.db ./data/ulsync.db-wal ./data/ulsync.db-shm
+./ulsync-server -config config.yaml
+
+# Example metadata (one file per device id used in Connect)
+rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_phone.db
+rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_tablet.db
+rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_watch.db
+```
+
+Rebuilding the server binary (`go build`) is **not** required for a clean run —
+only the database files above.
+
 ## Run two windows on macOS
 
 Build once, then open two separate processes with `open -n`:
@@ -109,7 +143,9 @@ URL `http://127.0.0.1:8080`, tap **Connect**.
 In **window 2**: User `alice`, Device ID `tablet`, same token and URL, **Connect**.
 
 Press **+** in the phone window. The tablet counter becomes `1` without
-pressing refresh. Both windows show `1`.
+pressing refresh. Both windows show `1`. After the first plus, phone Events
+should show a **small** cursor (for example `cursor 1`), not a large number
+left over from an old metadata file.
 
 Do not run two `flutter run` sessions against the same build output — they
 overwrite each other. Use one build and two `open -n` launches.
