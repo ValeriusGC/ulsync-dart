@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 17:22:29 +0500  
-**Version:** 7  
+**Updated:** 2026-09-08 08:31:05 +0300  
+**Version:** 8  
 **Document type:** readme
 
 ## What this is
@@ -85,6 +85,13 @@ final subscription = client.live().listen((event) {
 macOS or iOS simulator use `http://127.0.0.1:8080`. The `example/` app
 reads the same values from `--dart-define` so it is not an identity
 provider.
+
+To see a click move between two windows, run the `example/` app twice on
+macOS as described in [`example/README.md`](example/README.md): one build,
+two `open -n` launches, different Device ID values, one local server. The
+example uses a tap journal (`counter_operation`) instead of a single integer
+so concurrent pluses both arrive. An **Offline** switch per window queues
+local edits without closing the client.
 
 **`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
 prefixes such as `/api` are not supported; requests always go to
