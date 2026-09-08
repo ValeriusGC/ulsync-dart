@@ -26,3 +26,5 @@ jobs:
         working-directory: example
       - run: dart analyze --fatal-infos
         working-directory: example
+      - run: flutter test
+        working-directory: example

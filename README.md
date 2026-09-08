@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-04 17:22:29 +0500  
-**Version:** 7  
+**Updated:** 2026-09-08 13:27:00 +0300  
+**Version:** 10  
 **Document type:** readme
 
 ## What this is
@@ -85,6 +85,13 @@ final subscription = client.live().listen((event) {
 macOS or iOS simulator use `http://127.0.0.1:8080`. The `example/` app
 reads the same values from `--dart-define` so it is not an identity
 provider.
+
+To see a click move between two windows, run the `example/` app twice on
+macOS as described in [`example/README.md`](example/README.md): one build,
+two `open -n` launches, different Device ID values, one local server. The
+example uses a tap journal (`counter_operation`) instead of a single integer
+so concurrent pluses both arrive. An **Offline** switch per window queues
+local edits without closing the client.
 
 **`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
 prefixes such as `/api` are not supported; requests always go to
@@ -180,6 +187,21 @@ Application tables and migrations are never touched.
 **What is stored:** creation and edit timestamps, revision number, originating
 `source_id`, schema version, a pending-push (`dirty`) flag, and the server feed
 cursor per `userScope`.
+
+**Auto-heal (cursor ahead of the server).** If the server store was reset or
+replaced while this metadata file survived, the local cursor can be higher than
+the server's feed head. Pull and live would then skip new rows with no error.
+The engine **auto-heals** on every [`syncOnce`](lib/src/engine/sync_engine.dart)
+and when opening the live feed:
+
+1. Read the stored cursor `L` from this metadata file.
+2. Probe the server feed head `H` with paginated `pull(since: 0)` (read-only).
+3. When `L > H`, reset the local cursor to `0` and replay the feed from the
+   beginning; [`EntityAdapter.apply`](lib/src/engine/entity_adapter.dart) must
+   be idempotent so already-known rows are harmless.
+
+The server is never modified by this step. Sign out and a fresh metadata file
+are still required when changing accounts (`userScope`).
 
 **What is not stored:** entity payloads (the application adapter supplies
 content at push time), bearer tokens, or any user identifier beyond the
