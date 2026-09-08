@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-08 09:55:00 +0300  
-**Version:** 9  
+**Updated:** 2026-09-08 13:27:00 +0300  
+**Version:** 10  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,8 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Engine auto-heal when local metadata cursor is ahead of the server feed
-  head (for example after a server-side store reset): replay from `since=0`
+- Engine **auto-heal** when local metadata cursor is ahead of the server feed
+  head (for example after a server-side store reset): compare `L` to `H` via
+  `pull(since: 0)`, reset local cursor when `L > H`, replay from `since=0`
   without mutating the server.
 
 ### Changed

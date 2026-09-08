@@ -1,8 +1,8 @@
 # ulsync example
 
 **Created:** 2026-09-08 08:31:05 +0300  
-**Updated:** 2026-09-08 09:55:00 +0300  
-**Version:** 3  
+**Updated:** 2026-09-08 13:27:00 +0300  
+**Version:** 4  
 **Document type:** readme
 
 ## What this is
@@ -95,12 +95,18 @@ dirty queue). The example stores them under the macOS app sandbox. Wiping
 only the server's `./data/ulsync.db` **without** deleting these files used to
 leave the client cursor **ahead** of the server — live opened with
 `since=<local cursor>` and **skipped** new envelopes (tablet stayed at `0`
-while phone showed `pushed … cursor 18`). The engine now **reconciles** on
-Connect (`syncOnce`) and before live: when local cursor is ahead of the server
-feed head, it resets and replays from the beginning. Deleting client metadata
-below is still recommended for a perfectly clean demo; it is **not** required
-for the two-window plus test after a server-only reset. **Disconnect** does
-not remove metadata; quit the app (**Cmd+Q**) first.
+while phone showed `pushed … cursor 18`). The engine **auto-heals** on Connect
+(`syncOnce`) and before live:
+
+1. Read local cursor `L` from the metadata file for this Device ID.
+2. Probe server feed head `H` with `pull(since: 0)` (server is read-only).
+3. When `L > H`, reset the local cursor and replay from the beginning
+   (idempotent apply).
+
+After a server-only reset, the two-window plus test works **without** deleting
+client metadata below. Deleting those files is still recommended for a
+perfectly clean demo. **Disconnect** does not remove metadata; quit the app
+(**Cmd+Q**) first.
 
 Other files in `ulsync-server/data/` (`ulsync-load.db`, ad-hoc names) are
 **not** the operator store; only `ulsync.db` matters for this demo.

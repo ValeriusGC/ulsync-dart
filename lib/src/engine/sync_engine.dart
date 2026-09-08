@@ -188,10 +188,11 @@ final class UlsyncClient {
 
   /// Pushes the dirty queue, then pulls until a short page.
   ///
-  /// Push and pull run under the same lock so they cannot race the live
-  /// ingest. A network or HTTP `5xx` error is thrown; `dirty` stays set and
-  /// the application calls this again. There is no retry timer inside the
-  /// library.
+  /// Before pull, the engine **auto-heals** when the stored cursor is ahead
+  /// of the server feed head (see README, *Local metadata*). Push and pull run
+  /// under the same lock so they cannot race the live ingest. A network or
+  /// HTTP `5xx` error is thrown; `dirty` stays set and the application calls
+  /// this again. There is no retry timer inside the library.
   ///
   /// `applied: false` still clears dirty: the server already holds a
   /// non-inferior row (SPEC section 7). Leaving dirty set retries forever.
@@ -217,9 +218,10 @@ final class UlsyncClient {
   /// Returns the outbound event stream, starting the live feed once.
   ///
   /// Synchronous: the HTTP session starts on a later microtask after the
-  /// applied cursor is loaded, so the first open does not send `since=0`
-  /// against a non-empty store. Reopens call `appliedSince` again and see
-  /// the cursor as of **now**, not as of the first [live] call.
+  /// applied cursor is loaded and **auto-healed** when ahead of the server
+  /// feed head, so the first open does not send a stale `since`. Reopens call
+  /// `appliedSince` again and see the cursor as of **now**, not as of the
+  /// first [live] call.
   Stream<SyncEvent> live() {
     _ensureOpen();
     if (!_liveStarted) {
@@ -289,10 +291,7 @@ final class UlsyncClient {
     var since = 0;
     while (true) {
       _ensureOpen();
-      final page = await _transport.pull(
-        since: since,
-        limit: kPullPageLimit,
-      );
+      final page = await _transport.pull(since: since, limit: kPullPageLimit);
       if (page.envelopes.length < kPullPageLimit) {
         return page.nextCursor;
       }
