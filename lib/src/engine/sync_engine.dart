@@ -53,6 +53,12 @@ final class _SyncCounters {
   int applied = 0;
 }
 
+/// Zone key set while [UlsyncClient.write]'s persist callback runs.
+///
+/// Nested [UlsyncClient] calls would wait forever on the serial lock; the
+/// lock helper throws [StateError] instead of hanging.
+final Object _writeZoneKey = Object();
+
 /// End-to-end last-write-wins client: queue, pull, live, one lock.
 ///
 /// The application records local edits with [write] (mark first, persist
@@ -162,7 +168,8 @@ final class UlsyncClient {
   /// The engine owns the revision. The application must not mint it: a stale
   /// number loses a last-write-wins tie and the edit disappears silently.
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
-  /// (the store is not touched). Throws [StateError] after [close].
+  /// (the store is not touched). Throws [StateError] after [close], or when
+  /// called from inside the persist callback of [write].
   Future<void> markChanged({required String entityType, required String id}) {
     _ensureOpen();
     return _serialized(() async {
@@ -198,15 +205,17 @@ final class UlsyncClient {
   /// dirty, load `null`, and clear the mark — the loss this method exists
   /// to prevent.
   ///
-  /// Do not call [UlsyncClient] methods from [persist]: the serial lock is
-  /// held for the whole callback, so a nested call waits forever.
+  /// Do not call [UlsyncClient] methods from [persist]. That would wait on
+  /// this lock forever. The engine throws a [StateError] instead of hanging.
+  /// Write only application data there.
   ///
   /// Returns whatever [persist] returns. If [persist] throws, the error is
   /// rethrown as-is and the dirty mark remains.
   ///
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
   /// (the store is not touched, [persist] does not run). Throws [StateError]
-  /// after [close].
+  /// after [close], or when called from inside another [write]'s persist
+  /// callback.
   Future<T> write<T>({
     required String entityType,
     required String id,
@@ -228,7 +237,9 @@ final class UlsyncClient {
         id: id,
         adapter: adapter,
       );
-      return await persist();
+      // The mark is written before entering the persist zone so this
+      // method's own [_serialized] call is not treated as re-entry.
+      return await runZoned(persist, zoneValues: {_writeZoneKey: true});
     });
   }
 
@@ -336,7 +347,17 @@ final class UlsyncClient {
   ///
   /// [_tail] is a [Completer] completed in `whenComplete`, not the action's
   /// own future, so one error does not stall the queue.
+  ///
+  /// The first line rejects re-entry from [write]'s persist callback. Nested
+  /// [UlsyncClient] calls would wait on this lock forever; a [StateError] is
+  /// louder than a hang in a sync library.
   Future<T> _serialized<T>(Future<T> Function() action) {
+    if (Zone.current[_writeZoneKey] == true) {
+      throw StateError(
+        'do not call UlsyncClient methods inside the persist callback; '
+        'write only application data there',
+      );
+    }
     final previous = _tail;
     late final Completer<void> gate;
     gate = Completer<void>();
