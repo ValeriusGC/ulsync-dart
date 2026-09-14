@@ -53,10 +53,18 @@ final class _SyncCounters {
   int applied = 0;
 }
 
+/// Zone key set while [UlsyncClient.write]'s persist callback runs.
+///
+/// Nested [UlsyncClient] calls would wait forever on the serial lock; the
+/// lock helper throws [StateError] instead of hanging.
+final Object _writeZoneKey = Object();
+
 /// End-to-end last-write-wins client: queue, pull, live, one lock.
 ///
-/// The application calls [markChanged], [syncOnce], and [live]. Protocol,
-/// HTTP, cursor, and the send queue stay inside.
+/// The application records local edits with [write] (mark first, persist
+/// second, same lock). [markChanged] remains as a low-level primitive.
+/// [syncOnce] and [live] move data. Protocol, HTTP, cursor, and the send
+/// queue stay inside.
 final class UlsyncClient {
   /// Creates a client bound to one user, one device, and one metadata store.
   ///
@@ -139,17 +147,29 @@ final class UlsyncClient {
 
   /// Mutex tail. Each [_serialized] call waits for this, then replaces it.
   ///
-  /// Covers [markChanged], the whole of [syncOnce], and **one** live
-  /// message — not the live subscription itself. Holding the lock for the
-  /// lifetime of [live] would make [syncOnce] wait forever.
+  /// Covers [markChanged], the whole of [write] including its persist
+  /// callback, the whole of [syncOnce], and **one** live message — not the
+  /// live subscription itself. Holding the lock for the lifetime of [live]
+  /// would make [syncOnce] wait forever. Releasing it between the dirty mark
+  /// of [write] and persist would let [syncOnce] clear the mark after
+  /// `load` returned `null`.
   Future<void> _tail = Future<void>.value();
 
   /// Records a local edit: bumps revision, sets dirty, writes metadata.
   ///
+  /// **Low-level primitive.** Prefer [write], which marks the record
+  /// *before* the application persist callback and holds the serial lock
+  /// for the whole callback. Calling this *after* a local write can lose
+  /// the record forever: a crash, an unawaited future, or a skipped call
+  /// leaves application data with no dirty mark, and nothing ever sends
+  /// it. Use this only when the application cannot persist through the
+  /// library (for example a later self-check pass).
+  ///
   /// The engine owns the revision. The application must not mint it: a stale
   /// number loses a last-write-wins tie and the edit disappears silently.
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
-  /// (the store is not touched). Throws [StateError] after [close].
+  /// (the store is not touched). Throws [StateError] after [close], or when
+  /// called from inside the persist callback of [write].
   Future<void> markChanged({required String entityType, required String id}) {
     _ensureOpen();
     return _serialized(() async {
@@ -162,28 +182,97 @@ final class UlsyncClient {
           'no adapter registered',
         );
       }
-      final existing = await store.stateOf(
+      await _markChangedLocked(
+        entityType: entityType,
+        id: id,
+        adapter: adapter,
+      );
+    });
+  }
+
+  /// Marks [id] dirty, then runs [persist] while holding the serial lock.
+  ///
+  /// This is the recommended way to record a local edit. The dirty mark is
+  /// written **before** [persist] runs. The two stores (library metadata and
+  /// the application's database) cannot share a transaction, so a crash in
+  /// the middle must choose a side: a mark without data is healed on the
+  /// next push (`load` returns `null` and the engine clears dirty). Data
+  /// without a mark is a silent permanent loss. That is why the order is
+  /// not reversed even when "write the row first" looks more natural.
+  ///
+  /// The same serial lock covers [persist]. Releasing it between the mark
+  /// and the application write would let a concurrent [syncOnce] observe
+  /// dirty, load `null`, and clear the mark — the loss this method exists
+  /// to prevent.
+  ///
+  /// Do not call [UlsyncClient] methods from [persist]. That would wait on
+  /// this lock forever. The engine throws a [StateError] instead of hanging.
+  /// Write only application data there.
+  ///
+  /// Returns whatever [persist] returns. If [persist] throws, the error is
+  /// rethrown as-is and the dirty mark remains.
+  ///
+  /// Throws [ArgumentError] when no adapter is registered for [entityType]
+  /// (the store is not touched, [persist] does not run). Throws [StateError]
+  /// after [close], or when called from inside another [write]'s persist
+  /// callback.
+  Future<T> write<T>({
+    required String entityType,
+    required String id,
+    required Future<T> Function() persist,
+  }) {
+    _ensureOpen();
+    return _serialized(() async {
+      _ensureOpen();
+      final adapter = _adapters[entityType];
+      if (adapter == null) {
+        throw ArgumentError.value(
+          entityType,
+          'entityType',
+          'no adapter registered',
+        );
+      }
+      await _markChangedLocked(
+        entityType: entityType,
+        id: id,
+        adapter: adapter,
+      );
+      // The mark is written before entering the persist zone so this
+      // method's own [_serialized] call is not treated as re-entry.
+      return await runZoned(persist, zoneValues: {_writeZoneKey: true});
+    });
+  }
+
+  /// Writes a dirty metadata row for [id]. Caller already holds [_serialized].
+  ///
+  /// Shared by [markChanged] and [write] so the two public marks cannot
+  /// drift. [adapter] is already resolved; this method does not look it up.
+  Future<void> _markChangedLocked({
+    required String entityType,
+    required String id,
+    required EntityAdapter<dynamic> adapter,
+  }) async {
+    final existing = await store.stateOf(
+      userScope: userScope,
+      entityType: entityType,
+      id: id,
+      part: kEnvelopePart,
+    );
+    final now = DateTime.now().millisecondsSinceEpoch;
+    await store.put(
+      EntityState(
         userScope: userScope,
         entityType: entityType,
         id: id,
         part: kEnvelopePart,
-      );
-      final now = DateTime.now().millisecondsSinceEpoch;
-      await store.put(
-        EntityState(
-          userScope: userScope,
-          entityType: entityType,
-          id: id,
-          part: kEnvelopePart,
-          createdAtMs: existing?.createdAtMs ?? now,
-          lastEditedAtMs: now,
-          revision: (existing?.revision ?? 0) + 1,
-          sourceId: sourceId,
-          schemaVersion: adapter.schemaVersion,
-          dirty: true,
-        ),
-      );
-    });
+        createdAtMs: existing?.createdAtMs ?? now,
+        lastEditedAtMs: now,
+        revision: (existing?.revision ?? 0) + 1,
+        sourceId: sourceId,
+        schemaVersion: adapter.schemaVersion,
+        dirty: true,
+      ),
+    );
   }
 
   /// Pushes the dirty queue, then pulls until a short page.
@@ -233,9 +322,9 @@ final class UlsyncClient {
 
   /// Stops live ingest, then closes transport and store.
   ///
-  /// A second call is a no-op. Later [markChanged], [syncOnce], or [live]
-  /// throw [StateError] with `UlsyncClient is closed`. Transport is closed
-  /// before the store so a last ingest cannot persist into a closed
+  /// A second call is a no-op. Later [write], [markChanged], [syncOnce], or
+  /// [live] throw [StateError] with `UlsyncClient is closed`. Transport is
+  /// closed before the store so a last ingest cannot persist into a closed
   /// database and look like a metadata bug.
   Future<void> close() async {
     if (_closed) {
@@ -258,7 +347,17 @@ final class UlsyncClient {
   ///
   /// [_tail] is a [Completer] completed in `whenComplete`, not the action's
   /// own future, so one error does not stall the queue.
+  ///
+  /// The first line rejects re-entry from [write]'s persist callback. Nested
+  /// [UlsyncClient] calls would wait on this lock forever; a [StateError] is
+  /// louder than a hang in a sync library.
   Future<T> _serialized<T>(Future<T> Function() action) {
+    if (Zone.current[_writeZoneKey] == true) {
+      throw StateError(
+        'do not call UlsyncClient methods inside the persist callback; '
+        'write only application data there',
+      );
+    }
     final previous = _tail;
     late final Completer<void> gate;
     gate = Completer<void>();

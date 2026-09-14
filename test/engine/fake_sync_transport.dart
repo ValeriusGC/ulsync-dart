@@ -19,6 +19,12 @@ final class FakeSyncTransport implements SyncTransport {
   /// Optional pull script. When omitted, the page is empty at [since].
   Future<PullPage> Function({required int since, int? limit})? onPull;
 
+  /// Invoked at the start of every [push], before the envelope list is stored.
+  ///
+  /// Used to detect a push that sneaks in while [UlsyncClient.write]'s persist
+  /// callback is still running.
+  void Function()? onBeforePush;
+
   /// Invoked at the start of every [pull], before [onPull].
   ///
   /// Used to detect overlap with a parked [EntityAdapter.apply] without
@@ -47,6 +53,7 @@ final class FakeSyncTransport implements SyncTransport {
   @override
   Future<List<PushResult>> push(List<Envelope> envelopes) async {
     _ensureOpen();
+    onBeforePush?.call();
     pushCalls.add(List<Envelope>.from(envelopes));
     final handler = onPush;
     if (handler != null) {

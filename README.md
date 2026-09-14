@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-08 13:27:00 +0300  
-**Version:** 10  
+**Updated:** 2026-09-14 09:15:04 +0300  
+**Version:** 11  
 **Document type:** readme
 
 ## What this is
@@ -43,6 +43,9 @@ Do not run `flutter pub add ulsync` — the package is not on pub.dev.
 The application talks to four types: `UlsyncClient`, `EntityAdapter`,
 `SyncReport`, and `SyncEvent`. Cursor, send queue, last-write-wins, retries
 of a dropped live socket, and the wire format stay inside the library.
+Local edits go through `UlsyncClient.write` so a dirty mark cannot be
+forgotten; `markChanged` remains as a low-level primitive (see **Recording
+a local edit** below).
 
 ```dart
 import 'dart:convert';
@@ -74,7 +77,11 @@ final client = UlsyncClient(
   ],
 );
 
-await client.markChanged(entityType: 'counter_operation', id: opId);
+await client.write(
+  entityType: 'counter_operation',
+  id: opId,
+  persist: () => localOpLog.append(op),
+);
 final result = await client.syncOnce();
 final subscription = client.live().listen((event) {
   // Update the screen from SyncEvent. Do not parse envelopes.
@@ -138,10 +145,46 @@ upsert by `id` is safe; an append without dedup duplicates the record.
 The opposite order (cursor first) would skip the record forever after
 the same crash, so the engine does not use it.
 
-Call `markChanged` after every local edit. The engine, not the
-application, increments `revision`. Then call `syncOnce` when the
-application decides it is a good time (foreground, not low battery).
-The library does **not** start a timer.
+## Recording a local edit
+
+The recommended path is `UlsyncClient.write`. The library marks the record
+dirty **first**, then runs the application's persist callback, and it holds
+the internal serial lock for the whole callback.
+
+That order is not taste. The library metadata database and the
+application's store cannot share a transaction, so a crash in the middle
+must pick a side:
+
+- Mark without data is safe. The next `syncOnce` calls `load`, gets
+  `null`, and already clears the dirty flag without POSTing.
+- Data without a mark is a silent permanent loss. Nothing will ever
+  send the row. Nobody notices.
+
+Holding the lock during `persist` is the other half of the same
+invariant. If the lock were released between the mark and the
+application write, a concurrent `syncOnce` could see dirty, load
+`null` (the row is not there yet), and clear the mark — the same
+loss. Do **not** call `UlsyncClient` methods from inside `persist`.
+That would wait on the lock forever; the library throws `StateError`
+instead of hanging. Write only application data there.
+
+```dart
+await client.write(
+  entityType: 'counter_operation',
+  id: op.id,
+  persist: () => localOpLog.append(op),
+);
+```
+
+`markChanged` stays in the public API. It is a **low-level primitive**
+for self-check (a later step) and for applications that cannot persist
+through the library. Calling it *after* a local write can lose the
+record forever if the process dies, the future is left unawaited, or
+the call is skipped. Prefer `write`. The engine, not the application,
+increments `revision`.
+
+Then call `syncOnce` when the application decides it is a good time
+(foreground, not low battery). The library does **not** start a timer.
 
 Listen to `live()` for `SyncEvent` values:
 

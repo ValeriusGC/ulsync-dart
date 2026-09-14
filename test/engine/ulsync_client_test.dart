@@ -665,4 +665,255 @@ void main() {
       );
     },
   );
+
+  test('write marks the record dirty before persist runs', () async {
+    final h = await _Harness.open();
+    var persistSawDirty = false;
+    await h.client.write<void>(
+      entityType: 'note',
+      id: 'e1',
+      persist: () async {
+        final state = await h.store.stateOf(
+          userScope: 'alice',
+          entityType: 'note',
+          id: 'e1',
+          part: 'full',
+        );
+        expect(state, isNotNull);
+        expect(state!.dirty, isTrue);
+        persistSawDirty = true;
+        h.appStore['e1'] = 'hello';
+      },
+    );
+    expect(persistSawDirty, isTrue);
+  });
+
+  test('write returns the persist callback result', () async {
+    final h = await _Harness.open();
+    final value = await h.client.write<int>(
+      entityType: 'note',
+      id: 'e1',
+      persist: () async {
+        h.appStore['e1'] = 'hello';
+        return 42;
+      },
+    );
+    expect(value, 42);
+  });
+
+  test(
+    'persist throw keeps the dirty mark; later syncOnce sends nothing and clears it',
+    () async {
+      final h = await _Harness.open();
+      await expectLater(
+        h.client.write<void>(
+          entityType: 'note',
+          id: 'e1',
+          persist: () async {
+            throw StateError('persist failed');
+          },
+        ),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            'persist failed',
+          ),
+        ),
+      );
+      final afterThrow = await h.store.stateOf(
+        userScope: 'alice',
+        entityType: 'note',
+        id: 'e1',
+        part: 'full',
+      );
+      expect(afterThrow, isNotNull);
+      expect(afterThrow!.dirty, isTrue);
+      expect(h.appStore.containsKey('e1'), isFalse);
+      final report = await h.client.syncOnce();
+      expect(report.pushed, 0);
+      expect(h.fake.pushCalls, isEmpty);
+      final afterSync = await h.store.stateOf(
+        userScope: 'alice',
+        entityType: 'note',
+        id: 'e1',
+        part: 'full',
+      );
+      expect(afterSync!.dirty, isFalse);
+    },
+  );
+
+  test(
+    'syncOnce inside persist throws StateError instead of deadlocking',
+    () async {
+      final h = await _Harness.open();
+      await expectLater(
+        h.client
+            .write<void>(
+              entityType: 'note',
+              id: 'e1',
+              persist: () async {
+                await h.client.syncOnce();
+              },
+            )
+            .timeout(const Duration(seconds: 2)),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('persist callback'),
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'markChanged inside persist throws StateError instead of deadlocking',
+    () async {
+      final h = await _Harness.open();
+      await expectLater(
+        h.client
+            .write<void>(
+              entityType: 'note',
+              id: 'e1',
+              persist: () async {
+                await h.client.markChanged(entityType: 'note', id: 'e1');
+              },
+            )
+            .timeout(const Duration(seconds: 2)),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('persist callback'),
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'nested write inside persist throws StateError instead of deadlocking',
+    () async {
+      final h = await _Harness.open();
+      var innerPersistRan = false;
+      await expectLater(
+        h.client
+            .write<void>(
+              entityType: 'note',
+              id: 'e1',
+              persist: () async {
+                await h.client.write<void>(
+                  entityType: 'note',
+                  id: 'e2',
+                  persist: () async {
+                    innerPersistRan = true;
+                  },
+                );
+              },
+            )
+            .timeout(const Duration(seconds: 2)),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('persist callback'),
+          ),
+        ),
+      );
+      expect(innerPersistRan, isFalse);
+    },
+  );
+
+  test(
+    'write with an unknown entityType throws ArgumentError and does not touch the store',
+    () async {
+      final h = await _Harness.open();
+      var persistRan = false;
+      await expectLater(
+        h.client.write<void>(
+          entityType: 'no_such_type',
+          id: 'e1',
+          persist: () async {
+            persistRan = true;
+          },
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(persistRan, isFalse);
+      expect(
+        await h.store.stateOf(
+          userScope: 'alice',
+          entityType: 'no_such_type',
+          id: 'e1',
+          part: 'full',
+        ),
+        isNull,
+      );
+    },
+  );
+
+  test('write after close throws StateError', () async {
+    final h = await _Harness.open();
+    await h.client.close();
+    var persistRan = false;
+    expect(
+      () => h.client.write<void>(
+        entityType: 'note',
+        id: 'e1',
+        persist: () async {
+          persistRan = true;
+        },
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('UlsyncClient is closed'),
+        ),
+      ),
+    );
+    expect(persistRan, isFalse);
+  });
+
+  test(
+    'write and concurrent syncOnce push the persisted payload once',
+    () async {
+      final h = await _Harness.open();
+      final persistEntered = Completer<void>();
+      final persistHold = Completer<void>();
+      var pushWhilePersistHeld = false;
+      h.fake.onBeforePush = () {
+        if (!persistHold.isCompleted) {
+          pushWhilePersistHeld = true;
+        }
+      };
+      final writeFuture = h.client.write<void>(
+        entityType: 'note',
+        id: 'e1',
+        persist: () async {
+          persistEntered.complete();
+          await persistHold.future;
+          h.appStore['e1'] = 'from-write';
+        },
+      );
+      await persistEntered.future;
+      final syncFuture = h.client.syncOnce();
+      for (var i = 0; i < 8; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(h.fake.pushCalls, isEmpty);
+      expect(pushWhilePersistHeld, isFalse);
+      persistHold.complete();
+      await writeFuture;
+      await syncFuture;
+      expect(h.fake.pushCalls, hasLength(1));
+      expect(h.fake.pushCalls.single, hasLength(1));
+      final envelope = h.fake.pushCalls.single.single;
+      expect(envelope.id, 'e1');
+      expect(_memoFrom(envelope.payload).text, 'from-write');
+      expect(pushWhilePersistHeld, isFalse);
+    },
+  );
 }

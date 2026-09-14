@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-08 13:27:00 +0300  
-**Version:** 10  
+**Updated:** 2026-09-14 09:15:04 +0300  
+**Version:** 11  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `UlsyncClient.write`: marks a record dirty before the application persist
+  callback runs, under the same serial lock, so a local edit cannot miss the
+  send queue. `markChanged` stays as the low-level primitive.
 - Engine **auto-heal** when local metadata cursor is ahead of the server feed
   head (for example after a server-side store reset): compare `L` to `H` via
   `pull(since: 0)`, reset local cursor when `L > H`, replay from `since=0`
