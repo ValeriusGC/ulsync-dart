@@ -9,6 +9,7 @@ library;
 
 export 'src/engine/entity_adapter.dart' show EntityAdapter;
 export 'src/engine/sync_engine.dart' show UlsyncClient;
+export 'src/engine/self_check_report.dart' show SelfCheckReport;
 export 'src/engine/sync_event.dart'
     show
         SyncEvent,
@@ -26,6 +27,10 @@ export 'src/store/sembast_metadata_store.dart' show SembastMetadataStore;
 export 'src/transport/sync_transport.dart'
     show
         SyncTransport,
+        SyncDiffTransport,
+        DiffProbe,
+        DiffGap,
+        DiffVerdict,
         PushResult,
         PullPage,
         LiveMessage,
