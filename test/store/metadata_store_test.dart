@@ -320,4 +320,96 @@ void main() {
     );
     await factory.deleteDatabase(path);
   });
+
+  test('markDirty sets dirty and leaves every other field unchanged', () async {
+    final store = await openMemoryStore();
+    final before = sampleState(
+      createdAtMs: 1_111,
+      lastEditedAtMs: 2_222,
+      revision: 7,
+      sourceId: 'device-a',
+      schemaVersion: 3,
+      dirty: false,
+    );
+    await store.put(before);
+    expect(
+      await store.markDirty(
+        userScope: 'alice',
+        entityType: 'note',
+        id: 'entity-1',
+        part: 'full',
+      ),
+      isTrue,
+    );
+    final after = await store.stateOf(
+      userScope: 'alice',
+      entityType: 'note',
+      id: 'entity-1',
+      part: 'full',
+    );
+    expect(after, isNotNull);
+    expect(after!.dirty, isTrue);
+    expect(after.createdAtMs, before.createdAtMs);
+    expect(after.lastEditedAtMs, before.lastEditedAtMs);
+    expect(after.revision, before.revision);
+    expect(after.sourceId, before.sourceId);
+    expect(after.schemaVersion, before.schemaVersion);
+    expect(after.userScope, before.userScope);
+    expect(after.entityType, before.entityType);
+    expect(after.id, before.id);
+    expect(after.part, before.part);
+  });
+
+  test(
+    'markDirty returns false for an unknown row and creates nothing',
+    () async {
+      final store = await openMemoryStore();
+      expect(
+        await store.markDirty(
+          userScope: 'alice',
+          entityType: 'note',
+          id: 'no-such',
+          part: 'full',
+        ),
+        isFalse,
+      );
+      expect(
+        await store.stateOf(
+          userScope: 'alice',
+          entityType: 'note',
+          id: 'no-such',
+          part: 'full',
+        ),
+        isNull,
+      );
+      expect(await store.allStates('alice'), isEmpty);
+    },
+  );
+
+  test('allStates returns only the requested userScope', () async {
+    final store = await openMemoryStore();
+    await store.put(sampleState(userScope: 'alice', id: 'a1', dirty: true));
+    await store.put(sampleState(userScope: 'alice', id: 'a2', dirty: false));
+    await store.put(sampleState(userScope: 'bob', id: 'b1', dirty: true));
+    final alice = await store.allStates('alice');
+    expect(alice.map((s) => s.id), ['a1', 'a2']);
+    expect(await store.allStates('bob').then((s) => s.map((e) => e.id)), [
+      'b1',
+    ]);
+    expect(await store.allStates('carol'), isEmpty);
+  });
+
+  test(
+    'readSourceId is null until writeSourceId and does not leak across users',
+    () async {
+      final store = await openMemoryStore();
+      expect(await store.readSourceId('alice'), isNull);
+      await store.writeSourceId('alice', 'device-a');
+      expect(await store.readSourceId('alice'), 'device-a');
+      expect(await store.readSourceId('bob'), isNull);
+      await store.writeSourceId('bob', 'device-b');
+      expect(await store.readSourceId('alice'), 'device-a');
+      expect(await store.readSourceId('bob'), 'device-b');
+    },
+  );
 }
