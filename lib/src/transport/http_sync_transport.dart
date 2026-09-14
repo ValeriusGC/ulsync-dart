@@ -93,12 +93,12 @@ Duration nextBackoff(int failedAttempt, Duration initial, Duration cap) {
 }
 
 /// HTTP transport to one ulsync origin.
-final class HttpSyncTransport implements SyncTransport {
+final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
   /// Creates a transport that talks to [baseUrl].
   ///
   /// [baseUrl] is an origin such as `http://127.0.0.1:8080` or
   /// `http://10.0.2.2:8080`. A path prefix such as `/api` is not supported:
-  /// paths are always `/v1/sync/push` and `/v1/sync/pull`.
+  /// paths are always `/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`.
   ///
   /// [addJitter] defaults to [addFullJitter]. Tests that need order-of-
   /// magnitude delays pass `(base, _) => base` to disable the random addend.
@@ -198,6 +198,35 @@ final class HttpSyncTransport implements SyncTransport {
     return _parsePullPage(response.body);
   }
 
+  /// POSTs `/v1/sync/diff`. HTTP 404 and 405 mean the route is absent.
+  ///
+  /// Those two statuses return `null` (check unavailable). Any other
+  /// non-success is an exception, the same policy as [push] and [pull]. An
+  /// empty [probes] list is not sent: SPEC section 3.4 rejects empty `items`
+  /// with 400, and «nothing to report» is an empty result list instead.
+  @override
+  Future<List<DiffVerdict>?> diff(List<DiffProbe> probes) async {
+    _ensureOpen();
+    if (probes.isEmpty) {
+      return const [];
+    }
+    final body = jsonEncode({'items': probes.map((p) => p.toJson()).toList()});
+    final response = await _sendWithAuthRetry((token) {
+      final request = http.Request('POST', _diffUri());
+      request.headers['Authorization'] = 'Bearer $token';
+      request.headers['Content-Type'] = 'application/json';
+      request.headers['Accept'] = 'application/json';
+      request.body = body;
+      return request;
+    });
+    final status = response.statusCode;
+    if (status == 404 || status == 405) {
+      return null;
+    }
+    _throwIfHttpError(response);
+    return _parseDiffVerdicts(response.body);
+  }
+
   /// Opens the live SSE feed.
   ///
   /// Only one live stream at a time; a second call throws [StateError]
@@ -275,6 +304,8 @@ final class HttpSyncTransport implements SyncTransport {
 
   Uri _pullUri(Map<String, String> query) =>
       baseUrl.replace(path: '/v1/sync/pull', queryParameters: query);
+
+  Uri _diffUri() => baseUrl.replace(path: '/v1/sync/diff');
 
   /// Reads a non-empty token or throws [UlsyncUnauthorized] without I/O.
   Future<String> _requireToken() async {
@@ -432,6 +463,45 @@ final class HttpSyncTransport implements SyncTransport {
       );
     }
     return PullPage(envelopes: envelopes, nextCursor: cursor);
+  }
+
+  /// Parses SPEC section 3.4 `missing` and `stale` arrays. Both must be lists,
+  /// never omitted and never JSON `null`.
+  List<DiffVerdict> _parseDiffVerdicts(String body) {
+    final map = _decodeObject(body, 'missing');
+    final missing = _requireObjectList(map, 'missing');
+    final stale = _requireObjectList(map, 'stale');
+    return [
+      for (final row in missing) DiffVerdict.fromJson(row, DiffGap.missing),
+      for (final row in stale) DiffVerdict.fromJson(row, DiffGap.stale),
+    ];
+  }
+
+  List<Map<String, Object?>> _requireObjectList(
+    Map<String, Object?> map,
+    String field,
+  ) {
+    final raw = map[field];
+    if (raw == null) {
+      throw UlsyncProtocolException(
+        'Diff response missing $field',
+        field: field,
+      );
+    }
+    if (raw is! List) {
+      throw UlsyncProtocolException('Diff $field is not a list', field: field);
+    }
+    final rows = <Map<String, Object?>>[];
+    for (final item in raw) {
+      if (item is! Map) {
+        throw UlsyncProtocolException(
+          'Diff $field row is not an object',
+          field: field,
+        );
+      }
+      rows.add(Map<String, Object?>.from(item));
+    }
+    return rows;
   }
 
   Map<String, Object?> _decodeObject(String text, String field) {

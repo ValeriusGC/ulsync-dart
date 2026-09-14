@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-14 09:15:04 +0300  
-**Version:** 11  
+**Updated:** 2026-09-14 12:04:53 +0300  
+**Version:** 12  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `UlsyncClient.selfCheck`: three-phase anti-entropy (installation identity,
+  application ids vs metadata, metadata vs `POST /v1/sync/diff`). Runs once
+  per client on the first `syncOnce`. Marking an already-known row does not
+  change its conflict clock. `listIds` on the adapter is optional.
 - `UlsyncClient.write`: marks a record dirty before the application persist
   callback runs, under the same serial lock, so a local edit cannot miss the
   send queue. `markChanged` stays as the low-level primitive.

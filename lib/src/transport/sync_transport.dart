@@ -5,6 +5,7 @@
 library;
 
 import '../protocol/envelope.dart';
+import '../protocol/errors.dart';
 
 /// Transport to the sync server.
 ///
@@ -149,4 +150,204 @@ final class LiveCursor extends LiveMessage {
 final class LiveHeartbeat extends LiveMessage {
   /// Creates a heartbeat marker.
   const LiveHeartbeat();
+}
+
+/// Optional capability: the divergence check of SPEC section 3.4.
+///
+/// Separate from [SyncTransport] on purpose. Existing implementations —
+/// including test doubles in applications — keep compiling, and a transport
+/// that cannot run the check is a supported configuration, not an error.
+abstract interface class SyncDiffTransport {
+  /// POSTs `/v1/sync/diff`.
+  ///
+  /// Returns null when the server does not implement the endpoint (HTTP 404
+  /// or 405). Null means «unavailable», not «nothing to report»: an empty
+  /// list means the latter.
+  Future<List<DiffVerdict>?> diff(List<DiffProbe> probes);
+}
+
+/// One record as the client holds it: identity plus the three ranks of SPEC
+/// section 2. All three are sent because section 2 ranks by all three, in
+/// order; a request carrying fewer cannot be answered without guessing.
+final class DiffProbe {
+  /// Creates a probe for one `(id, part)` with the client's three ranks.
+  const DiffProbe({
+    required this.id,
+    required this.part,
+    required this.lastEditedAtMs,
+    required this.revision,
+    required this.sourceId,
+  });
+
+  /// Record identity, as in SPEC section 1.1.
+  final String id;
+
+  /// Slice; identity is `(id, part)`. Round 1 always `full`.
+  final String part;
+
+  /// First rank of SPEC section 2, as the **client** holds it.
+  final int lastEditedAtMs;
+
+  /// Second rank of SPEC section 2, as the **client** holds it.
+  final int revision;
+
+  /// Third rank of SPEC section 2, as the **client** holds it.
+  final String sourceId;
+
+  /// Parses one item from a SPEC section 3.4 request body.
+  factory DiffProbe.fromJson(Map<String, Object?> json) {
+    return DiffProbe(
+      id: _diffRequireString(json, 'id'),
+      part: _diffRequireString(json, 'part'),
+      lastEditedAtMs: _diffRequireInt(json, 'last_edited_at_ms'),
+      revision: _diffRequireInt(json, 'revision'),
+      sourceId: _diffRequireString(json, 'source_id'),
+    );
+  }
+
+  /// Serializes this probe to the wire `items[]` object.
+  Map<String, Object?> toJson() => {
+    'id': id,
+    'part': part,
+    'last_edited_at_ms': lastEditedAtMs,
+    'revision': revision,
+    'source_id': sourceId,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is DiffProbe &&
+      id == other.id &&
+      part == other.part &&
+      lastEditedAtMs == other.lastEditedAtMs &&
+      revision == other.revision &&
+      sourceId == other.sourceId;
+
+  @override
+  int get hashCode => Object.hash(id, part, lastEditedAtMs, revision, sourceId);
+
+  @override
+  String toString() =>
+      'DiffProbe($id/$part t=$lastEditedAtMs rev=$revision src=$sourceId)';
+}
+
+/// Why the server named this key. Both kinds lead to the same client action —
+/// mark and push; the kind exists so the report can tell them apart.
+enum DiffGap {
+  /// The server holds no row for this `(id, part)` and this user.
+  missing,
+
+  /// The server holds a row that loses to the client's by SPEC section 2.
+  stale,
+}
+
+/// One key the server named, with its own ranks when it holds a losing row.
+///
+/// Server ranks are optional and filled only for [DiffGap.stale]. The client
+/// does not use them to decide what to do — both kinds mean mark and push —
+/// they exist so a human reading the report can see how far behind the
+/// server is.
+final class DiffVerdict {
+  /// Creates one named key.
+  const DiffVerdict({
+    required this.id,
+    required this.part,
+    required this.gap,
+    this.serverLastEditedAtMs,
+    this.serverRevision,
+    this.serverSourceId,
+  });
+
+  /// Record identity echoed from the request.
+  final String id;
+
+  /// Slice echoed from the request.
+  final String part;
+
+  /// Whether the server lacks the row or holds a losing copy.
+  final DiffGap gap;
+
+  /// Server's first rank when [gap] is [DiffGap.stale].
+  final int? serverLastEditedAtMs;
+
+  /// Server's second rank when [gap] is [DiffGap.stale].
+  final int? serverRevision;
+
+  /// Server's third rank when [gap] is [DiffGap.stale].
+  final String? serverSourceId;
+
+  /// Parses one object from `missing` or `stale`.
+  factory DiffVerdict.fromJson(Map<String, Object?> json, DiffGap gap) {
+    if (gap == DiffGap.stale) {
+      return DiffVerdict(
+        id: _diffRequireString(json, 'id'),
+        part: _diffRequireString(json, 'part'),
+        gap: gap,
+        serverLastEditedAtMs: _diffRequireInt(json, 'last_edited_at_ms'),
+        serverRevision: _diffRequireInt(json, 'revision'),
+        serverSourceId: _diffRequireString(json, 'source_id'),
+      );
+    }
+    return DiffVerdict(
+      id: _diffRequireString(json, 'id'),
+      part: _diffRequireString(json, 'part'),
+      gap: gap,
+    );
+  }
+
+  /// Serializes this verdict to the matching `missing` or `stale` object.
+  Map<String, Object?> toJson() {
+    final map = <String, Object?>{'id': id, 'part': part};
+    if (gap == DiffGap.stale) {
+      map['last_edited_at_ms'] = serverLastEditedAtMs;
+      map['revision'] = serverRevision;
+      map['source_id'] = serverSourceId;
+    }
+    return map;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is DiffVerdict &&
+      id == other.id &&
+      part == other.part &&
+      gap == other.gap &&
+      serverLastEditedAtMs == other.serverLastEditedAtMs &&
+      serverRevision == other.serverRevision &&
+      serverSourceId == other.serverSourceId;
+
+  @override
+  int get hashCode => Object.hash(
+    id,
+    part,
+    gap,
+    serverLastEditedAtMs,
+    serverRevision,
+    serverSourceId,
+  );
+
+  @override
+  String toString() => 'DiffVerdict($id/$part $gap)';
+}
+
+String _diffRequireString(Map<String, Object?> json, String field) {
+  final value = json[field];
+  if (value is! String || value.isEmpty) {
+    throw UlsyncProtocolException(
+      'Expected non-empty string for field: $field',
+      field: field,
+    );
+  }
+  return value;
+}
+
+int _diffRequireInt(Map<String, Object?> json, String field) {
+  final value = json[field];
+  if (value is! int) {
+    throw UlsyncProtocolException(
+      'Expected integer for field: $field',
+      field: field,
+    );
+  }
+  return value;
 }

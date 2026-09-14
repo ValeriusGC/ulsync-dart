@@ -590,4 +590,70 @@ void main() {
       throwsA(isA<StateError>()),
     );
   });
+
+  test('diff POSTs /v1/sync/diff and parses missing and stale', () async {
+    final server = await _bind([
+      ScriptedReply.json(
+        status: 200,
+        body: _fixture('diff/response_gaps.json'),
+      ),
+    ]);
+    final transport = _transport(server);
+    final request = decodeJsonMap(_fixture('diff/request.json'));
+    final rawItems = request['items']! as List<dynamic>;
+    final probes = [
+      for (final item in rawItems)
+        DiffProbe.fromJson(Map<String, Object?>.from(item as Map)),
+    ];
+    final verdicts = await transport.diff(probes);
+    expect(verdicts, isNotNull);
+    expect(verdicts, hasLength(3));
+    expect(verdicts![0].gap, DiffGap.missing);
+    expect(verdicts[0].id, '7c9e6679-7425-40de-944b-e07fc1f90ae7');
+    expect(verdicts[1].gap, DiffGap.stale);
+    expect(verdicts[1].serverLastEditedAtMs, 1756000000000);
+    expect(verdicts[1].serverRevision, 3);
+    expect(verdicts[2].serverRevision, 5);
+    expect(server.requests.single.method, 'POST');
+    expect(server.requests.single.path, '/v1/sync/diff');
+    final sent = decodeJsonMap(server.requests.single.body);
+    expect((sent['items']! as List).length, 4);
+  });
+
+  test('diff returns null on HTTP 404 and 405', () async {
+    final server = await _bind([
+      const ScriptedReply.json(status: 404, body: 'not found'),
+      const ScriptedReply.json(status: 405, body: 'nope'),
+    ]);
+    final transport = _transport(server);
+    final probe = DiffProbe(
+      id: 'e1',
+      part: 'full',
+      lastEditedAtMs: 1,
+      revision: 1,
+      sourceId: 'device-a',
+    );
+    expect(await transport.diff([probe]), isNull);
+    expect(await transport.diff([probe]), isNull);
+  });
+
+  test('diff throws UlsyncServerException on HTTP 500', () async {
+    final server = await _bind([
+      const ScriptedReply.json(status: 500, body: '{"error":"boom"}'),
+    ]);
+    final transport = _transport(server);
+    final probe = DiffProbe(
+      id: 'e1',
+      part: 'full',
+      lastEditedAtMs: 1,
+      revision: 1,
+      sourceId: 'device-a',
+    );
+    await expectLater(
+      transport.diff([probe]),
+      throwsA(
+        isA<UlsyncServerException>().having((e) => e.statusCode, 'status', 500),
+      ),
+    );
+  });
 }

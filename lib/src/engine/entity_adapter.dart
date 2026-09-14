@@ -17,6 +17,7 @@ final class EntityAdapter<T> {
   ///
   /// [entityType] after trim must be non-empty. Duplicate types are rejected
   /// by the client, not here, because only the client sees the full list.
+  /// [listIds] is optional: existing adapters keep compiling without it.
   EntityAdapter({
     required this.entityType,
     required this.schemaVersion,
@@ -24,6 +25,7 @@ final class EntityAdapter<T> {
     required this.decode,
     required this.load,
     required this.apply,
+    this.listIds,
   }) {
     if (entityType.trim().isEmpty) {
       throw ArgumentError.value(entityType, 'entityType', 'must be non-empty');
@@ -76,6 +78,13 @@ final class EntityAdapter<T> {
   /// is gone, and no later sync can see it. The engine does not use that
   /// order.
   final Future<void> Function(T value) apply;
+
+  /// Returns the ids of every record of this type the application stores.
+  ///
+  /// Optional. When absent, the library cannot compare its metadata with the
+  /// application's data, and reconciliation reports itself unavailable instead
+  /// of failing. Ids only: the library never asks for payload here.
+  final Future<List<String>> Function()? listIds;
 
   /// Encodes [value] after a cast to [T].
   ///

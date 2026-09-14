@@ -22,6 +22,12 @@ final _entities = stringMapStoreFactory.store('ulsync_entity');
 /// Per-user server feed cursor records keyed by [EntityState.userScope].
 final _cursors = stringMapStoreFactory.store('ulsync_cursor');
 
+/// Installation identity (`source_id`) last stored for a [EntityState.userScope].
+///
+/// A new named store does not bump [_databaseVersion]: sembast materializes
+/// it on first write. Existing version-1 files keep opening.
+final _sourceIds = stringMapStoreFactory.store('ulsync_source_id');
+
 /// Key of one entity record.
 ///
 /// Every part is percent-escaped before joining: without it the pairs
@@ -202,6 +208,77 @@ final class SembastMetadataStore {
       await record.update(txn, {'dirty': false});
       return true;
     });
+  }
+
+  /// Sets dirty on an existing record **without touching its clock**.
+  ///
+  /// This is a library primitive; application code should not call it.
+  /// Returns `false` when the record is unknown to the library. Neither
+  /// lastEditedAtMs, nor createdAtMs, nor revision changes: they are the ranks
+  /// of conflict resolution (SPEC section 2), and a reconciliation that
+  /// refreshed them would let a stale local copy defeat a newer copy from
+  /// another device — the very data loss this round removes.
+  Future<bool> markDirty({
+    required String userScope,
+    required String entityType,
+    required String id,
+    required String part,
+  }) {
+    final record = _entities.record(
+      _entityKey(
+        userScope: userScope,
+        entityType: entityType,
+        id: id,
+        part: part,
+      ),
+    );
+    return _db.transaction((txn) async {
+      final stored = await record.get(txn);
+      if (stored == null) {
+        return false;
+      }
+      if (stored['dirty'] == true) {
+        return true;
+      }
+      await record.update(txn, {'dirty': true});
+      return true;
+    });
+  }
+
+  /// Every known record of one user, dirty and clean alike.
+  ///
+  /// This is a library primitive; application code should not call it.
+  /// Used by the divergence check to build its request. The whole database is
+  /// in memory anyway, so this adds no I/O.
+  Future<List<EntityState>> allStates(String userScope) async {
+    final found = await _entities.find(
+      _db,
+      finder: Finder(
+        filter: Filter.equals('userScope', userScope),
+        sortOrders: [SortOrder('id'), SortOrder('entityType')],
+      ),
+    );
+    return found.map((s) => _fromMap(s.value)).toList(growable: false);
+  }
+
+  /// The source_id this user scope was last opened with, or null on first open.
+  ///
+  /// This is a library primitive; application code should not call it.
+  /// Stored so a changed installation identity is reported instead of silently
+  /// producing envelopes under a new third conflict rank (SPEC sections 1.4, 2).
+  Future<String?> readSourceId(String userScope) async {
+    final stored = await _sourceIds.record(userScope).get(_db);
+    if (stored == null) {
+      return null;
+    }
+    return stored['sourceId']! as String;
+  }
+
+  /// Records [sourceId] for [userScope]. Called once, on the first open.
+  ///
+  /// This is a library primitive; application code should not call it.
+  Future<void> writeSourceId(String userScope, String sourceId) {
+    return _sourceIds.record(userScope).put(_db, {'sourceId': sourceId});
   }
 
   /// Writes [state] and advances the feed cursor in one transaction.

@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-14 09:15:04 +0300  
-**Version:** 11  
+**Updated:** 2026-09-14 12:04:53 +0300  
+**Version:** 12  
 **Document type:** readme
 
 ## What this is
@@ -40,12 +40,14 @@ Do not run `flutter pub add ulsync` — the package is not on pub.dev.
 
 ## Getting started
 
-The application talks to four types: `UlsyncClient`, `EntityAdapter`,
-`SyncReport`, and `SyncEvent`. Cursor, send queue, last-write-wins, retries
-of a dropped live socket, and the wire format stay inside the library.
-Local edits go through `UlsyncClient.write` so a dirty mark cannot be
-forgotten; `markChanged` remains as a low-level primitive (see **Recording
-a local edit** below).
+The application talks to five types: `UlsyncClient`, `EntityAdapter`,
+`SyncReport`, `SyncEvent`, and `SelfCheckReport`. Cursor, send queue,
+last-write-wins, retries of a dropped live socket, the self-check, and the
+wire format stay inside the library. Local edits go through
+`UlsyncClient.write` so a dirty mark cannot be forgotten; `markChanged`
+remains as a low-level primitive (see **Recording a local edit** below).
+The library runs a self-check once on the first `syncOnce` of each client
+(see **Self-check**).
 
 ```dart
 import 'dart:convert';
@@ -102,8 +104,8 @@ local edits without closing the client.
 
 **`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
 prefixes such as `/api` are not supported; requests always go to
-`/v1/sync/push` and `/v1/sync/pull`. Ignored when a test supplies
-`transport`, but still required so production and tests share one
+`/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`. Ignored when a test
+supplies `transport`, but still required so production and tests share one
 constructor.
 
 **`userScope`.** The signed-in user. It is part of every metadata key. A
@@ -113,9 +115,14 @@ new `UlsyncClient` (or a new `userScope` on a fresh client) after
 sign-in; do not "reset on sign-out" as a best-effort extra call.
 
 **`sourceId`.** Stable installation id, written to envelope `source_id`.
-It is the third last-write-wins rank when edit time and revision tie.
-The library never invents it: only the application knows what counts as
-a device and only the application can persist it across launches.
+It is the third last-write-wins rank when edit time and revision tie
+(SPEC section 2). The library never invents it: only the application
+knows what counts as a device and only the application can persist it
+across launches. SPEC section 1.4 requires it to be unique per
+installation — mint it once, keep it out of platform backups, and do
+not let it change between launches. The library remembers the value on
+first open and throws `StateError` if a later client opens the same
+metadata file with a different id (see **Self-check**).
 
 **`tokenProvider`.** Called before every HTTP request, including the
 one-time 401 retry. Return the current access token, or `null` / blank
@@ -133,7 +140,9 @@ application store at push time.
 understands. Duplicate types throw at construction. A type that arrives
 from the server with no adapter is skipped, the cursor still advances,
 and `SyncUnknownType` is emitted — a foreign type must not stop sync of
-the types you do own.
+the types you do own. Optional `listIds` lets the self-check compare
+application data with library metadata; without it that phase reports
+unavailable and everything else still works.
 
 **`apply` must be idempotent.** The application store and the metadata
 database are different databases. There is no transaction that covers
@@ -177,14 +186,70 @@ await client.write(
 ```
 
 `markChanged` stays in the public API. It is a **low-level primitive**
-for self-check (a later step) and for applications that cannot persist
-through the library. Calling it *after* a local write can lose the
-record forever if the process dies, the future is left unawaited, or
-the call is skipped. Prefer `write`. The engine, not the application,
-increments `revision`.
+for applications that cannot persist through the library. Calling it
+*after* a local write can lose the record forever if the process dies,
+the future is left unawaited, or the call is skipped. Prefer `write`.
+The engine, not the application, increments `revision`.
 
 Then call `syncOnce` when the application decides it is a good time
 (foreground, not low battery). The library does **not** start a timer.
+The first `syncOnce` of each client also runs the self-check.
+
+## Self-check
+
+The library can push what it marked and pull what appeared on the
+server. It cannot, by itself, see records the application wrote before
+ulsync was wired, a restored backup, or a row that vanished only on
+the server. `selfCheck` finds that divergence and repairs it without
+asking where it came from.
+
+The application normally **never** calls `selfCheck`. The library runs
+it once per client instance on the first `syncOnce` — sign-in and
+account switch, which is when it is needed. There is no timer and it
+is not invoked from `live`.
+
+Three phases, in order:
+
+1. **Installation identity.** On first open the library stores
+   `source_id` in the metadata database. A later mismatch throws
+   `StateError` naming both values. Quietly continuing would swap the
+   third conflict rank and two devices could keep different payloads
+   forever (SPEC section 1.4). Restore the previous id, or if the
+   change is intentional, delete the metadata file.
+2. **Application data vs library metadata.** Optional
+   `EntityAdapter.listIds` returns every id of that type the
+   application stores — ids only, never payloads. For each id with no
+   metadata the library creates a row with `last_edited_at_ms = 0`,
+   `revision = 1`, and `dirty = true`. Time `0` means “unknown age”:
+   any real edit from another device wins. If no adapter provides
+   `listIds`, this phase reports itself unavailable and the rest of
+   sync still works. Existing adapters keep compiling; the field is
+   optional on purpose.
+3. **Library metadata vs the server.** `POST /v1/sync/diff` (SPEC
+   section 3.4) sends `(id, part)` plus the **three** ranks of SPEC
+   section 2, in batches of 500. The server answers `missing` (no row)
+   and `stale` (its row loses). The client does not compare ranks; it
+   marks the named keys **without changing** edit time, creation time,
+   or revision, then pushes through the ordinary queue. A server that
+   does not implement the route (`404` / `405`), or a transport that
+   cannot run the check, turns this phase off. That is a supported
+   configuration, not an error.
+
+A naive mark that stamped “now” would let a stale local copy defeat a
+newer copy from another device. Reconciliation therefore has its own
+mark, and it does not touch the conflict clock.
+
+What to call:
+
+| Situation | Call |
+|---|---|
+| Persist a local edit | `write` (preferred) or `markChanged` |
+| Exchange with the server | `syncOnce` |
+| Find and repair divergence | nothing — `selfCheck` runs on the first `syncOnce`. Call it only for a manual diagnostic. |
+
+There are no public `reconcile` or `verify` methods. One action, one
+report (`SelfCheckReport`): whether each phase was available, how many
+rows it marked, and how many dirty rows remain.
 
 Listen to `live()` for `SyncEvent` values:
 
