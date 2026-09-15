@@ -8,6 +8,7 @@ import 'dart:async';
 
 import '../protocol/envelope.dart';
 import '../protocol/errors.dart';
+import '../protocol/origin.dart';
 import '../store/entity_state.dart';
 import '../store/sembast_metadata_store.dart';
 import '../transport/http_sync_transport.dart';
@@ -70,11 +71,21 @@ final Object _writeZoneKey = Object();
 ///
 /// The application records local edits with [write] (mark first, persist
 /// second, same lock). [markChanged] remains as a low-level primitive.
-/// [syncOnce] and [live] move data. The first [syncOnce] of each instance
-/// also runs [selfCheck]. Protocol, HTTP, cursor, and the send queue stay
+/// [syncOnce] and [live] move data. The first network action of each
+/// instance is SPEC section 3.5 hello, then the first [syncOnce] runs
+/// [selfCheck]. Protocol, HTTP, cursor, and the send queue stay
 /// inside.
 final class UlsyncClient {
-  /// Creates a client bound to one user, one device, and one metadata store.
+  /// Creates a client bound to one user, one device, one origin, and one
+  /// metadata store.
+  ///
+  /// [origin] is minted once per application contour in the application
+  /// project, never per device, and is sent as `Ulsync-Origin`. Empty or
+  /// illegal strings throw [ArgumentError] here so a forgotten origin
+  /// cannot reach the network. When [transport] is omitted, the library
+  /// builds [HttpSyncTransport] with the same [origin]. A caller-supplied
+  /// HTTP transport must be constructed with that same string; non-HTTP
+  /// test doubles ignore the header.
   ///
   /// [baseUrl] and [tokenProvider] are ignored when [transport] is provided;
   /// they remain required so production and tests share one constructor
@@ -88,6 +99,7 @@ final class UlsyncClient {
   /// which would import Flutter into `lib/` and fail the import guard.
   UlsyncClient({
     required this.baseUrl,
+    required String origin,
     required String userScope,
     required String sourceId,
     required this.tokenProvider,
@@ -95,15 +107,27 @@ final class UlsyncClient {
     required List<EntityAdapter<dynamic>> adapters,
     SyncTransport? transport,
     this.beforePersistIncoming,
-  }) : userScope = _requireNonEmpty(userScope, 'userScope'),
+  }) : origin = requireUlsyncOrigin(origin),
+       userScope = _requireNonEmpty(userScope, 'userScope'),
        sourceId = _requireNonEmpty(sourceId, 'sourceId'),
        _adapters = _indexAdapters(adapters),
        _transport =
            transport ??
-           HttpSyncTransport(baseUrl: baseUrl, tokenProvider: tokenProvider);
+           HttpSyncTransport(
+             baseUrl: baseUrl,
+             tokenProvider: tokenProvider,
+             origin: origin,
+           );
 
-  /// Origin of the sync server. Ignored when a [SyncTransport] is injected.
+  /// Server URL. Ignored when a [SyncTransport] is injected.
   final Uri baseUrl;
+
+  /// Application-contour origin sent as `Ulsync-Origin`.
+  ///
+  /// Minted once per application contour in the application project, never
+  /// per device. Ignored by non-HTTP test doubles (they do not send
+  /// headers).
+  final String origin;
 
   /// Signed-in user; part of every metadata key so accounts never mix.
   final String userScope;
@@ -155,6 +179,25 @@ final class UlsyncClient {
   /// that call would recurse. The serial lock is not re-entrant; the drain
   /// must run **outside** [_serialized].
   bool _selfCheckRunning = false;
+
+  /// Whether SPEC section 3.5 hello already succeeded or was unavailable.
+  ///
+  /// Hello runs before [selfCheck] so a foreign store is refused before
+  /// reconciliation can seed it. HTTP `404` is not an error (old server).
+  /// [OriginMismatchException] (`409`) must not set this: the next call
+  /// repeats the refusal rather than swallow it.
+  bool _originChecked = false;
+
+  /// Whether [_ensureOrigin] is on the stack.
+  ///
+  /// Separate from [_selfCheckRunning]: a successful hello with a failed
+  /// self-check must not skip the check, and the reverse must not skip
+  /// hello. Hello is not invoked from inside [_serialized].
+  bool _originRunning = false;
+
+  /// In-flight hello, so a concurrent [syncOnce] waits instead of racing
+  /// past the gate.
+  Future<void>? _originInFlight;
 
   /// Whether [_runLive] has been started. [live] is idempotent.
   bool _liveStarted = false;
@@ -359,11 +402,13 @@ final class UlsyncClient {
 
   /// Pushes the dirty queue, then pulls until a short page.
   ///
-  /// On the first successful call of this instance, runs [selfCheck] first
-  /// (identity, local ids, server diff). The existing push/pull body is
-  /// unchanged: it is the drain for marks the check just made. [selfCheck]
-  /// itself is not invoked from inside [_serialized] — the lock is not
-  /// re-entrant, and that call would hang forever.
+  /// On the first successful call of this instance, names [origin] to the
+  /// server ([_ensureOrigin]) and then runs [selfCheck] (identity, local
+  /// ids, server diff). Hello is first because self-check would otherwise
+  /// seed a foreign store. The existing push/pull body is unchanged: it is
+  /// the drain for marks the check just made. Neither hello nor [selfCheck]
+  /// is invoked from inside [_serialized] — the lock is not re-entrant,
+  /// and that call would hang forever.
   ///
   /// Before pull, the engine **auto-heals** when the stored cursor is ahead
   /// of the server feed head (see README, *Local metadata*). Push and pull run
@@ -373,7 +418,9 @@ final class UlsyncClient {
   ///
   /// `applied: false` still clears dirty: the server already holds a
   /// non-inferior row (SPEC section 7). Leaving dirty set retries forever.
-  Future<SyncReport> syncOnce() {
+  Future<SyncReport> syncOnce() async {
+    _ensureOpen();
+    await _ensureOrigin();
     _ensureOpen();
     final Future<void> prelude;
     if (!_selfCheckDone && !_selfCheckRunning) {
@@ -417,11 +464,12 @@ final class UlsyncClient {
 
   /// Returns the outbound event stream, starting the live feed once.
   ///
-  /// Synchronous: the HTTP session starts on a later microtask after the
-  /// applied cursor is loaded and **auto-healed** when ahead of the server
-  /// feed head, so the first open does not send a stale `since`. Reopens call
-  /// `appliedSince` again and see the cursor as of **now**, not as of the
-  /// first [live] call.
+  /// Synchronous: hello and HTTP start on a later microtask after
+  /// [_ensureOrigin], the applied cursor is loaded, and **auto-healed**
+  /// when ahead of the server feed head, so a foreign store is refused
+  /// before envelopes arrive and the first open does not send a stale
+  /// `since`. Reopens call `appliedSince` again and see the cursor as of
+  /// **now**, not as of the first [live] call.
   Stream<SyncEvent> live() {
     _ensureOpen();
     if (!_liveStarted) {
@@ -452,6 +500,46 @@ final class UlsyncClient {
     if (!_events.isClosed) {
       await _events.close();
     }
+  }
+
+  /// Names [origin] to the server before any mail or [selfCheck].
+  ///
+  /// Hello is first because self-check would seed a foreign store. HTTP
+  /// `404`/`405` means the endpoint is absent, not a mismatch. `409` does
+  /// not set [_originChecked]: the next call must repeat the refusal.
+  /// Runs outside [_serialized] so it cannot deadlock the lock.
+  Future<void> _ensureOrigin() async {
+    if (_originChecked) {
+      assert(!_originRunning);
+      return;
+    }
+    final inFlight = _originInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+    _originRunning = true;
+    final future = _runOriginHandshake();
+    _originInFlight = future;
+    try {
+      await future;
+    } finally {
+      _originRunning = false;
+      if (identical(_originInFlight, future)) {
+        _originInFlight = null;
+      }
+    }
+  }
+
+  /// One hello attempt. Sets [_originChecked] only on success or unavailability.
+  Future<void> _runOriginHandshake() async {
+    final candidate = _transport;
+    if (candidate is SyncHelloTransport) {
+      // Separate interface; the `is` check does not promote a SyncTransport.
+      final helloTransport = candidate as SyncHelloTransport;
+      await helloTransport.hello(origin);
+    }
+    _originChecked = true;
   }
 
   /// Runs [action] after the previous serialized job, even if that job failed.
@@ -921,8 +1009,14 @@ final class UlsyncClient {
 
   /// Opens the live feed. Does not pull first: if the server is down, a pull
   /// would throw and nothing would keep trying. Catch-up is [syncOnce].
+  /// Hello runs first so a foreign store cannot apply envelopes on a live
+  /// URL miss.
   Future<void> _runLive() async {
     try {
+      await _ensureOrigin();
+      if (_closed) {
+        return;
+      }
       await _serialized(() async {
         await _ensureCursorLoaded();
       });

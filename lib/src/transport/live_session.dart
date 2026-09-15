@@ -46,6 +46,7 @@ final class LiveSession {
     required this._reopenBeforeExpiry,
     required this._unreadableExpInterval,
     required this._reconnectDelay,
+    required this._origin,
     required this._isTransportClosed,
     required this._onStopped,
     this.onConnectionState,
@@ -81,6 +82,9 @@ final class LiveSession {
 
   /// Pause after a failed live try. EventSource: a few seconds, does not grow.
   final Duration _reconnectDelay;
+
+  /// Application-contour origin sent as `Ulsync-Origin` on every live open.
+  final String _origin;
 
   /// True after the transport has been closed.
   final bool Function() _isTransportClosed;
@@ -172,6 +176,7 @@ final class LiveSession {
           final request = http.Request('GET', uri);
           request.headers['Authorization'] = 'Bearer $workingToken';
           request.headers['Accept'] = 'text/event-stream';
+          request.headers['Ulsync-Origin'] = _origin;
           streamed = await _client.send(request).timeout(_pushPullTimeout);
         } on TimeoutException {
           if (_halted) {
