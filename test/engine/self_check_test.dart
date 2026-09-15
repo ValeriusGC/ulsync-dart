@@ -142,7 +142,7 @@ void main() {
     expect(fake.pushCalls, hasLength(1));
   });
 
-  test('unknown application id is marked with time 0 and revision 1', () async {
+  test('unknown application id is marked with time 1 and revision 1', () async {
     final store = await _openStore();
     final fake = FakeDiffTransport();
     final appStore = <String, String>{'e1': 'hello'};
@@ -157,8 +157,8 @@ void main() {
     expect(fake.pushCalls, hasLength(1));
     final envelope = fake.pushCalls.single.single;
     expect(envelope.id, 'e1');
-    expect(envelope.lastEditedAtMs, 0);
-    expect(envelope.createdAtMs, 0);
+    expect(envelope.lastEditedAtMs, 1);
+    expect(envelope.createdAtMs, 1);
     expect(envelope.revision, 1);
   });
 
