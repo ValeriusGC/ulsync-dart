@@ -317,10 +317,10 @@ final class UlsyncClient {
   /// refreshing them would let a stale local copy defeat a newer copy from
   /// another device.
   ///
-  /// A record the library has never seen is created with time `0` and
-  /// revision `1`. Zero means unknown age: any real edit wins. The opposite
-  /// (treating it as fresh) would overwrite an edit the user already saw on
-  /// another device.
+  /// A record the library has never seen is created with time `1` and
+  /// revision `1`. One millisecond after epoch is older than any real edit,
+  /// so a copy from another device still wins. Zero cannot go on the wire:
+  /// the server rejects `created_at_ms <= 0`.
   ///
   /// Throws [StateError] when the stored `source_id` does not match this
   /// client's, after [close], or when called from inside [write]'s persist
@@ -531,16 +531,16 @@ final class UlsyncClient {
         if (existing != null) {
           continue;
         }
-        // Unknown to the library: not an edit, so not "now". Zero loses to
-        // any real last_edited_at_ms from another device.
+        // Unknown to the library. Time 1 is older than any real edit and is
+        // legal on the wire (the server rejects 0).
         await store.put(
           EntityState(
             userScope: userScope,
             entityType: adapter.entityType,
             id: id,
             part: kEnvelopePart,
-            createdAtMs: 0,
-            lastEditedAtMs: 0,
+            createdAtMs: 1,
+            lastEditedAtMs: 1,
             revision: 1,
             sourceId: sourceId,
             schemaVersion: adapter.schemaVersion,
@@ -747,12 +747,14 @@ final class UlsyncClient {
         await _clearDirty(row);
         continue;
       }
+      final createdAtMs = row.createdAtMs <= 0 ? 1 : row.createdAtMs;
+      final lastEditedAtMs = row.lastEditedAtMs <= 0 ? 1 : row.lastEditedAtMs;
       final envelope = Envelope(
         id: row.id,
         part: row.part,
         entityType: row.entityType,
-        createdAtMs: row.createdAtMs,
-        lastEditedAtMs: row.lastEditedAtMs,
+        createdAtMs: createdAtMs,
+        lastEditedAtMs: lastEditedAtMs,
         revision: row.revision,
         sourceId: row.sourceId,
         flags: kFlags,

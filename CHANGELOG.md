@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-14 12:04:53 +0300  
-**Version:** 12  
+**Updated:** 2026-09-14 17:22:00 +0300  
+**Version:** 13  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -27,6 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Self-check of unknown local ids uses time `1` (not `0`): older than any
+  real edit, and the server accepts it. Time `0` was rejected on push, so
+  G4 never healed.
 - Example application: tap counter with two macOS processes, per-device
   metadata file, and an Offline switch; memo text field removed.
 

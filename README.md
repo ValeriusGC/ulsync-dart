@@ -219,12 +219,12 @@ Three phases, in order:
 2. **Application data vs library metadata.** Optional
    `EntityAdapter.listIds` returns every id of that type the
    application stores — ids only, never payloads. For each id with no
-   metadata the library creates a row with `last_edited_at_ms = 0`,
-   `revision = 1`, and `dirty = true`. Time `0` means “unknown age”:
-   any real edit from another device wins. If no adapter provides
-   `listIds`, this phase reports itself unavailable and the rest of
-   sync still works. Existing adapters keep compiling; the field is
-   optional on purpose.
+   metadata the library creates a row with `last_edited_at_ms = 1`,
+   `revision = 1`, and `dirty = true`. Time `1` is older than any real
+   edit and is legal on the wire (the server rejects `created_at_ms <= 0`).
+   If no adapter provides `listIds`, this phase reports itself
+   unavailable and the rest of sync still works. Existing adapters
+   keep compiling; the field is optional on purpose.
 3. **Library metadata vs the server.** `POST /v1/sync/diff` (SPEC
    section 3.4) sends `(id, part)` plus the **three** ranks of SPEC
    section 2, in batches of 500. The server answers `missing` (no row)
