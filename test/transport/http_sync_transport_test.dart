@@ -5,7 +5,6 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ulsync/src/transport/jwt_expiry.dart';
@@ -16,9 +15,6 @@ import 'scripted_http_server.dart';
 
 /// Reason when the protocol submodule was not initialized.
 const _submoduleHint = 'git submodule update --init';
-
-/// Identity jitter so backoff tests can check order of magnitude.
-Duration _noJitter(Duration base, Random _) => base;
 
 String _fixture(String relative) {
   final path = 'protocol/fixtures/$relative';
@@ -62,25 +58,21 @@ HttpSyncTransport _transport(
   ScriptedHttpServer server, {
   Future<String?> Function()? tokenProvider,
   Duration? pushPullTimeout,
+  Duration? liveHeaderTimeout,
   Duration? silenceTimeout,
-  Duration? reconnectInitial,
-  Duration? reconnectCap,
-  Duration? stableConnection,
+  Duration? reconnectInterval,
   Duration? reopenBeforeExpiry,
   Duration? unreadableExpInterval,
-  Duration Function(Duration base, Random random)? addJitter,
 }) {
   final transport = HttpSyncTransport(
     baseUrl: server.baseUrl,
     tokenProvider: tokenProvider ?? () async => 'token',
     pushPullTimeout: pushPullTimeout ?? const Duration(seconds: 5),
+    liveHeaderTimeout: liveHeaderTimeout ?? const Duration(seconds: 5),
     silenceTimeout: silenceTimeout ?? const Duration(seconds: 30),
-    reconnectInitial: reconnectInitial ?? const Duration(milliseconds: 20),
-    reconnectCap: reconnectCap ?? const Duration(milliseconds: 200),
-    stableConnection: stableConnection ?? const Duration(seconds: 30),
+    reconnectInterval: reconnectInterval ?? const Duration(milliseconds: 20),
     reopenBeforeExpiry: reopenBeforeExpiry ?? const Duration(hours: 1),
     unreadableExpInterval: unreadableExpInterval ?? const Duration(hours: 1),
-    addJitter: addJitter ?? _noJitter,
   );
   addTearDown(transport.close);
   return transport;
@@ -404,7 +396,7 @@ void main() {
     final transport = _transport(
       server,
       silenceTimeout: const Duration(milliseconds: 300),
-      reconnectInitial: const Duration(milliseconds: 20),
+      reconnectInterval: const Duration(milliseconds: 20),
     );
     final probe = _LiveProbe.listen(transport.live(appliedSince: () => 0));
     addTearDown(probe.subscription.cancel);
@@ -412,37 +404,42 @@ void main() {
     expect(probe.done, isFalse);
   });
 
-  test('reconnect backoff grows and does not exceed the cap', () async {
-    final server = await _bind([
-      const ScriptedReply.sse(),
-      const ScriptedReply.sse(),
-      const ScriptedReply.sse(),
-      const ScriptedReply.sse(),
-    ]);
-    final transport = _transport(
-      server,
-      reconnectInitial: const Duration(milliseconds: 50),
-      reconnectCap: const Duration(milliseconds: 200),
-      addJitter: _noJitter,
-    );
-    final probe = _LiveProbe.listen(transport.live(appliedSince: () => 0));
-    addTearDown(probe.subscription.cancel);
-    await server.waitForRequests(4, timeout: const Duration(seconds: 2));
-    final times = server.requests.map((r) => r.receivedAt).toList();
-    final intervals = [
-      times[1].difference(times[0]),
-      times[2].difference(times[1]),
-      times[3].difference(times[2]),
-    ];
-    expect(intervals[0], greaterThan(const Duration(milliseconds: 20)));
-    expect(intervals[1], greaterThan(intervals[0]));
-    const slack = Duration(milliseconds: 80);
-    expect(
-      intervals.every((d) => d <= const Duration(milliseconds: 200) + slack),
-      isTrue,
-      reason: 'intervals $intervals',
-    );
-  });
+  test(
+    'live retries on a fixed pause, like EventSource; the wait does not grow',
+    () async {
+      final server = await _bind([
+        const ScriptedReply.sse(),
+        const ScriptedReply.sse(),
+        const ScriptedReply.sse(),
+        const ScriptedReply.sse(),
+      ]);
+      final transport = _transport(
+        server,
+        reconnectInterval: const Duration(milliseconds: 50),
+      );
+      final probe = _LiveProbe.listen(transport.live(appliedSince: () => 0));
+      addTearDown(probe.subscription.cancel);
+      await server.waitForRequests(4, timeout: const Duration(seconds: 2));
+      final times = server.requests.map((r) => r.receivedAt).toList();
+      final intervals = [
+        times[1].difference(times[0]),
+        times[2].difference(times[1]),
+        times[3].difference(times[2]),
+      ];
+      expect(
+        intervals.every((d) => d >= const Duration(milliseconds: 20)),
+        isTrue,
+        reason: 'intervals $intervals',
+      );
+      const slack = Duration(milliseconds: 80);
+      expect(
+        intervals.every((d) => d <= const Duration(milliseconds: 50) + slack),
+        isTrue,
+        reason: 'intervals $intervals',
+      );
+      expect(probe.done, isFalse);
+    },
+  );
 
   test('reconnect uses the appliedSince cursor from the engine, not zero and '
       'not last-seen', () async {
@@ -552,31 +549,20 @@ void main() {
     expect(unreadProbe.done, isFalse);
   });
 
-  test(
-    'stable connection longer than stableConnection resets backoff to initial',
-    () async {
-      final server = await _bind([
-        const ScriptedReply.sse(closeAfter: Duration(milliseconds: 120)),
-        const ScriptedReply.sse(holdOpen: true),
-      ]);
-      final transport = _transport(
-        server,
-        stableConnection: const Duration(milliseconds: 80),
-        reconnectInitial: const Duration(milliseconds: 50),
-        reconnectCap: const Duration(milliseconds: 400),
-        addJitter: _noJitter,
-      );
-      final probe = _LiveProbe.listen(transport.live(appliedSince: () => 0));
-      addTearDown(probe.subscription.cancel);
-      await server.waitForRequests(2, timeout: const Duration(seconds: 2));
-      final gap = server.requests[1].receivedAt.difference(
-        server.requests[0].receivedAt,
-      );
-      // Held ~120ms, then initial 50ms — not a doubled 100ms on top of 120.
-      expect(gap, lessThan(const Duration(milliseconds: 280)));
-      expect(gap, greaterThan(const Duration(milliseconds: 120)));
-    },
-  );
+  test('live reconnects after the stream closes', () async {
+    final server = await _bind([
+      const ScriptedReply.sse(closeAfter: Duration(milliseconds: 40)),
+      const ScriptedReply.sse(holdOpen: true),
+    ]);
+    final transport = _transport(
+      server,
+      reconnectInterval: const Duration(milliseconds: 50),
+    );
+    final probe = _LiveProbe.listen(transport.live(appliedSince: () => 0));
+    addTearDown(probe.subscription.cancel);
+    await server.waitForRequests(2, timeout: const Duration(seconds: 2));
+    expect(probe.done, isFalse);
+  });
 
   test('second live() throws StateError while the first stream is alive', () {
     final transport = HttpSyncTransport(

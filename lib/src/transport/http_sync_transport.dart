@@ -7,7 +7,6 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -17,12 +16,25 @@ import 'exceptions.dart';
 import 'live_session.dart';
 import 'sync_transport.dart';
 
-/// Deadline for push, pull, and live **headers**.
+/// Deadline for push and pull **headers**.
 ///
 /// 30 seconds covers a slow mobile round trip without waiting for the OS
-/// TCP timeout. The live **body** has no deadline; [kSilenceTimeout]
-/// watches it instead.
+/// TCP timeout. Live open uses [kReconnectInterval] wait after a failed
+/// try; headers themselves use [kLiveHeaderTimeout].
 const Duration kPushPullTimeout = Duration(seconds: 30);
+
+/// How long to wait for live **headers** before giving up this try.
+///
+/// If the server is down, do not sit 30 seconds on one socket. Fail this
+/// try and knock again after [kReconnectInterval].
+const Duration kLiveHeaderTimeout = Duration(seconds: 5);
+
+/// Pause between live tries when the connection is down.
+///
+/// Same as EventSource in the browser (WHATWG: a few seconds; Chrome ~3s):
+/// first try is immediate; if it fails, wait 3 seconds and try again.
+/// The wait does **not** grow.
+const Duration kReconnectInterval = Duration(seconds: 3);
 
 /// Silence watchdog for the live body.
 ///
@@ -30,22 +42,6 @@ const Duration kPushPullTimeout = Duration(seconds: 30);
 /// `config.example.yaml`). Carrier NAT closes idle TCP without RST; a
 /// server `: ping` that nobody watches leaves the client on a dead pipe.
 const Duration kSilenceTimeout = Duration(seconds: 45);
-
-/// First reconnect delay after a dropped live stream.
-///
-/// The first open does not wait. Only reconnects back off.
-const Duration kReconnectInitial = Duration(seconds: 1);
-
-/// Ceiling of the backoff **base** before jitter is added.
-///
-/// Capping the *total* (base + jitter) at 30s would squeeze jitter to zero
-/// at the ceiling and recreate the thundering herd that jitter prevents.
-const Duration kReconnectCap = Duration(seconds: 30);
-
-/// A live connection shorter than this does not reset backoff.
-///
-/// Otherwise a connect-and-drop loop would look like success.
-const Duration kStableConnection = Duration(minutes: 1);
 
 /// Reopen the live feed this long **before** JWT `exp`.
 ///
@@ -59,39 +55,6 @@ const Duration kReopenBeforeExpiry = Duration(seconds: 60);
 /// Immediate reopen would spin; waiting forever would miss rotation.
 const Duration kUnreadableExpInterval = Duration(minutes: 30);
 
-/// Full jitter on top of a capped base: delay is `[base, 2*base)`, and the
-/// base itself never exceeds [kReconnectCap].
-///
-/// Capping the *total* at 30s would squeeze jitter to zero at the ceiling
-/// and recreate the thundering herd the jitter exists to prevent. After a
-/// server restart every device would otherwise reconnect in the same
-/// millisecond.
-Duration addFullJitter(Duration base, Random random) {
-  final ms = base.inMilliseconds;
-  if (ms <= 0) {
-    return Duration.zero;
-  }
-  return Duration(milliseconds: ms + random.nextInt(ms + 1));
-}
-
-/// Backoff base for [failedAttempt] (0 = first reconnect).
-///
-/// Doubles [initial] until [cap]. The cap applies to the base; jitter is
-/// added on top by [addFullJitter].
-Duration nextBackoff(int failedAttempt, Duration initial, Duration cap) {
-  var ms = initial.inMilliseconds;
-  for (var i = 0; i < failedAttempt; i++) {
-    ms *= 2;
-    if (ms >= cap.inMilliseconds) {
-      return cap;
-    }
-  }
-  if (ms > cap.inMilliseconds) {
-    return cap;
-  }
-  return Duration(milliseconds: ms);
-}
-
 /// HTTP transport to one ulsync origin.
 final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
   /// Creates a transport that talks to [baseUrl].
@@ -99,24 +62,16 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
   /// [baseUrl] is an origin such as `http://127.0.0.1:8080` or
   /// `http://10.0.2.2:8080`. A path prefix such as `/api` is not supported:
   /// paths are always `/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`.
-  ///
-  /// [addJitter] defaults to [addFullJitter]. Tests that need order-of-
-  /// magnitude delays pass `(base, _) => base` to disable the random addend.
   HttpSyncTransport({
     required this.baseUrl,
     required this.tokenProvider,
     this.pushPullTimeout = kPushPullTimeout,
+    this.liveHeaderTimeout = kLiveHeaderTimeout,
     this.silenceTimeout = kSilenceTimeout,
-    this.reconnectInitial = kReconnectInitial,
-    this.reconnectCap = kReconnectCap,
-    this.stableConnection = kStableConnection,
+    this.reconnectInterval = kReconnectInterval,
     this.reopenBeforeExpiry = kReopenBeforeExpiry,
     this.unreadableExpInterval = kUnreadableExpInterval,
-    Random? random,
-    Duration Function(Duration base, Random random)? addJitter,
-  }) : _random = random ?? Random(),
-       _addJitter = addJitter ?? addFullJitter,
-       _client = http.Client();
+  }) : _client = http.Client();
 
   /// Origin of the sync server; path is ignored.
   final Uri baseUrl;
@@ -127,32 +82,23 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
   /// network call.
   final Future<String?> Function() tokenProvider;
 
-  /// Deadline for push, pull, and live headers. See [kPushPullTimeout].
+  /// Deadline for push and pull headers. See [kPushPullTimeout].
   final Duration pushPullTimeout;
+
+  /// Deadline for live open headers. See [kLiveHeaderTimeout].
+  final Duration liveHeaderTimeout;
 
   /// Live-body silence watchdog. See [kSilenceTimeout].
   final Duration silenceTimeout;
 
-  /// First reconnect delay. See [kReconnectInitial].
-  final Duration reconnectInitial;
-
-  /// Backoff base ceiling. See [kReconnectCap].
-  final Duration reconnectCap;
-
-  /// Minimum live duration that resets backoff. See [kStableConnection].
-  final Duration stableConnection;
+  /// Pause between live tries. See [kReconnectInterval].
+  final Duration reconnectInterval;
 
   /// How long before JWT `exp` to reopen. See [kReopenBeforeExpiry].
   final Duration reopenBeforeExpiry;
 
   /// Fallback when `exp` is unreadable. See [kUnreadableExpInterval].
   final Duration unreadableExpInterval;
-
-  /// Random source for jitter; injectable so tests can pass a seeded instance.
-  final Random _random;
-
-  /// Jitter function; production uses [addFullJitter].
-  final Duration Function(Duration base, Random random) _addJitter;
 
   /// One client for the lifetime of this object (HTTP keep-alive).
   final http.Client _client;
@@ -256,15 +202,11 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       tokenProvider: tokenProvider,
       appliedSince: appliedSince,
       controller: controller,
-      pushPullTimeout: pushPullTimeout,
+      pushPullTimeout: liveHeaderTimeout,
       silenceTimeout: silenceTimeout,
-      stableConnection: stableConnection,
       reopenBeforeExpiry: reopenBeforeExpiry,
       unreadableExpInterval: unreadableExpInterval,
-      backoffDelay: (int failedAttempt) => _addJitter(
-        nextBackoff(failedAttempt, reconnectInitial, reconnectCap),
-        _random,
-      ),
+      reconnectDelay: reconnectInterval,
       isTransportClosed: () => _closed,
       onStopped: () {
         if (identical(_liveSession, session)) {
