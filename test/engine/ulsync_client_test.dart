@@ -126,6 +126,7 @@ final class _Harness {
     final applyCount = <int>[0];
     final client = UlsyncClient(
       baseUrl: Uri.parse('http://engine.test'),
+      origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
       userScope: 'alice',
       sourceId: 'device-a',
       tokenProvider: () async => 'test-token',

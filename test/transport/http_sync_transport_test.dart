@@ -66,6 +66,7 @@ HttpSyncTransport _transport(
 }) {
   final transport = HttpSyncTransport(
     baseUrl: server.baseUrl,
+    origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
     tokenProvider: tokenProvider ?? () async => 'token',
     pushPullTimeout: pushPullTimeout ?? const Duration(seconds: 5),
     liveHeaderTimeout: liveHeaderTimeout ?? const Duration(seconds: 5),
@@ -567,6 +568,7 @@ void main() {
   test('second live() throws StateError while the first stream is alive', () {
     final transport = HttpSyncTransport(
       baseUrl: Uri.parse('http://127.0.0.1:1'),
+      origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
       tokenProvider: () async => 'token',
     );
     addTearDown(transport.close);
