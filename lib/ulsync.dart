@@ -10,6 +10,7 @@ library;
 export 'src/engine/entity_adapter.dart' show EntityAdapter;
 export 'src/engine/sync_engine.dart' show UlsyncClient;
 export 'src/engine/self_check_report.dart' show SelfCheckReport;
+export 'src/protocol/origin.dart' show OriginMismatchException;
 export 'src/engine/sync_event.dart'
     show
         SyncEvent,
@@ -28,6 +29,8 @@ export 'src/transport/sync_transport.dart'
     show
         SyncTransport,
         SyncDiffTransport,
+        SyncHelloTransport,
+        HelloResult,
         DiffProbe,
         DiffGap,
         DiffVerdict,

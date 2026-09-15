@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-14 12:04:53 +0300  
-**Version:** 12  
+**Updated:** 2026-09-15 14:18:21 +0300  
+**Version:** 13  
 **Document type:** readme
 
 ## What this is
@@ -46,8 +46,9 @@ last-write-wins, retries of a dropped live socket, the self-check, and the
 wire format stay inside the library. Local edits go through
 `UlsyncClient.write` so a dirty mark cannot be forgotten; `markChanged`
 remains as a low-level primitive (see **Recording a local edit** below).
-The library runs a self-check once on the first `syncOnce` of each client
-(see **Self-check**).
+The first network call of each client is an origin handshake
+(see **Origin**); the library then runs a self-check once on the first
+`syncOnce` (see **Self-check**).
 
 ```dart
 import 'dart:convert';
@@ -63,6 +64,7 @@ final databasePath = kIsWeb
 
 final client = UlsyncClient(
   baseUrl: Uri.parse('http://10.0.2.2:8080'),
+  origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
   userScope: userId,
   sourceId: deviceId,
   tokenProvider: () async => supabase.auth.currentSession?.accessToken,
@@ -104,9 +106,14 @@ local edits without closing the client.
 
 **`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
 prefixes such as `/api` are not supported; requests always go to
-`/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`. Ignored when a test
-supplies `transport`, but still required so production and tests share one
-constructor.
+`/v1/sync/hello`, `/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`.
+Ignored when a test supplies `transport`, but still required so production
+and tests share one constructor.
+
+**`origin`.** Application-contour name sent as `Ulsync-Origin` (SPEC
+section 1.5). Required. Empty, blank, longer than 256 characters, or
+outside the SPEC character class is `ArgumentError` at construction —
+the network is not touched. Not a URL and not `userScope`. See **Origin**.
 
 **`userScope`.** The signed-in user. It is part of every metadata key. A
 different account on the same device must not inherit the previous
@@ -154,6 +161,63 @@ upsert by `id` is safe; an append without dedup duplicates the record.
 The opposite order (cursor first) would skip the record forever after
 the same crash, so the engine does not use it.
 
+## Origin
+
+`origin` names the **application contour** this client belongs to: one
+deployment of one application (production, staging, or a private
+server). It is not the server URL, not `userScope`, and not `sourceId`.
+The analog is SQLite `PRAGMA application_id` or an Android
+`applicationId`: the store is marked “this application”, not “this
+phone”.
+
+Recommended form: reverse-DNS of the application plus a **project**
+UUID (Universally Unique Identifier), kept in source control next to
+the server URL:
+
+```
+com.company.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f
+```
+
+Mint that UUID once when the project is created. Every installation of
+this contour sends the same string. A UUID minted on the device at
+first launch would make the second phone a foreign client forever —
+that is a protocol violation, and this library will not invent
+`origin` for you.
+
+SPEC section 1.5 character class: `A–Z`, `a–z`, `0–9`, `.`, `_`, `/`,
+`-`. Length 1–256 after trim. Anything else is `ArgumentError` at
+construction.
+
+Two modes live on the server (see the
+[ulsync-server README](https://github.com/ValeriusGC/ulsync-server)):
+
+- **Open store** — no `origin` in server config. The first well-formed
+  `GET /v1/sync/hello` imprints the store. Later clients with a
+  different string are refused.
+- **Authored store** — the operator set `origin` in `config.yaml`
+  before any client. A different string (or a missing header on that
+  server) is refused even while the envelope table is empty.
+
+HTTP transport sends `Ulsync-Origin` on hello, push, pull, diff, and
+live. A test double without HTTP does not send a header; that is
+expected.
+
+The first network action of a `UlsyncClient` instance is
+`GET /v1/sync/hello`, **before** `selfCheck` and **before** the live
+feed opens. `write` does not call hello: local data stays on the
+device until the next exchange. Hello runs outside the engine serial
+lock, the same rule as `selfCheck`.
+
+| Server response | Client |
+|---|---|
+| `200` | Handshake done for this instance; `syncOnce` / `live` continue |
+| `404` or `405` | Endpoint absent (old server). Handshake marked unavailable; exchange continues as in round 1a. There is no foreign-store gate on that server |
+| `409` | `OriginMismatchException` naming `storeOrigin` and `requestOrigin`. The done flag is **not** set: the next call repeats the refusal. Point this application at the store the constant was built for, or change the constant and the store configuration together. The library will not rewrite `origin` |
+| Network error | Flag not set; the error is thrown; the next `syncOnce` retries hello |
+
+A transport that does not implement `SyncHelloTransport` is treated as
+hello-unavailable (test doubles and custom non-HTTP transports).
+
 ## Recording a local edit
 
 The recommended path is `UlsyncClient.write`. The library marks the record
@@ -193,7 +257,8 @@ The engine, not the application, increments `revision`.
 
 Then call `syncOnce` when the application decides it is a good time
 (foreground, not low battery). The library does **not** start a timer.
-The first `syncOnce` of each client also runs the self-check.
+The first `syncOnce` of each client names `origin` to the server, then
+runs the self-check.
 
 ## Self-check
 
@@ -204,9 +269,9 @@ the server. `selfCheck` finds that divergence and repairs it without
 asking where it came from.
 
 The application normally **never** calls `selfCheck`. The library runs
-it once per client instance on the first `syncOnce` — sign-in and
-account switch, which is when it is needed. There is no timer and it
-is not invoked from `live`.
+it once per client instance on the first `syncOnce`, **after** the origin
+handshake succeeds or is unavailable — sign-in and account switch, which
+is when it is needed. There is no timer and it is not invoked from `live`.
 
 Three phases, in order:
 
@@ -243,6 +308,8 @@ What to call:
 
 | Situation | Call |
 |---|---|
+| Name the application contour | `origin:` on `UlsyncClient` — always. There is no setter. |
+| Handshake with the store | nothing — `GET /v1/sync/hello` runs before the first `syncOnce` exchange and before `live` opens |
 | Persist a local edit | `write` (preferred) or `markChanged` |
 | Exchange with the server | `syncOnce` |
 | Find and repair divergence | nothing — `selfCheck` runs on the first `syncOnce`. Call it only for a manual diagnostic. |
@@ -414,6 +481,7 @@ the transport object. Reusing the client keeps TCP and TLS connections alive
 (HTTP keep-alive). Creating a new client per request would handshake again
 every few minutes, which on a phone is both slow and expensive.
 
+`HttpSyncTransport` sends `Ulsync-Origin` on every `/v1/sync/*` request.
 `push` and `pull` wait at most 30 seconds for a complete response. The live
 feed (`GET /v1/sync/pull?live=sse`) has no overall deadline — it is meant to
 stay open. Waiting for **headers** of that request still uses the 30-second

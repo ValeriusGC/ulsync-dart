@@ -166,6 +166,43 @@ abstract interface class SyncDiffTransport {
   Future<List<DiffVerdict>?> diff(List<DiffProbe> probes);
 }
 
+/// Optional capability: SPEC section 3.5 origin handshake.
+///
+/// Separate from [SyncTransport] on purpose. Existing implementations —
+/// including test doubles — keep compiling. A transport that cannot run
+/// hello is treated as handshake unavailable, not as a mismatch.
+abstract interface class SyncHelloTransport {
+  /// GETs `/v1/sync/hello` with [origin] as `Ulsync-Origin`.
+  ///
+  /// Returns null when the server does not implement the endpoint
+  /// (HTTP 404 or 405). Null means «unavailable», not «mismatch».
+  /// Hello runs before self-check so a foreign store is refused before
+  /// reconciliation can seed it.
+  Future<HelloResult?> hello(String origin);
+}
+
+/// Body of a successful SPEC section 3.5 hello (`200`).
+final class HelloResult {
+  /// Creates a result from the store origin and the token subject.
+  const HelloResult({required this.origin, required this.userId});
+
+  /// Origin the store holds after this request (after imprint it equals
+  /// the request header).
+  final String origin;
+
+  /// Token `sub`, so the client can confirm it is not another account
+  /// on the same store.
+  final String userId;
+
+  /// Parses a `200` hello body. Both [origin] and `user_id` are required.
+  factory HelloResult.fromJson(Map<String, Object?> json) {
+    return HelloResult(
+      origin: _diffRequireString(json, 'origin'),
+      userId: _diffRequireString(json, 'user_id'),
+    );
+  }
+}
+
 /// One record as the client holds it: identity plus the three ranks of SPEC
 /// section 2. All three are sent because section 2 ranks by all three, in
 /// order; a request carrying fewer cannot be answered without guessing.

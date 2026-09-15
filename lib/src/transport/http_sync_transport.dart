@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 
 import '../protocol/envelope.dart';
 import '../protocol/errors.dart';
+import '../protocol/origin.dart';
 import 'exceptions.dart';
 import 'live_session.dart';
 import 'sync_transport.dart';
@@ -55,15 +56,22 @@ const Duration kReopenBeforeExpiry = Duration(seconds: 60);
 /// Immediate reopen would spin; waiting forever would miss rotation.
 const Duration kUnreadableExpInterval = Duration(minutes: 30);
 
-/// HTTP transport to one ulsync origin.
-final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
-  /// Creates a transport that talks to [baseUrl].
+/// HTTP transport to one ulsync server URL.
+///
+/// Sends `Ulsync-Origin` on every `/v1/sync/*` request. The value is the
+/// constructor [origin], never minted here.
+final class HttpSyncTransport
+    implements SyncTransport, SyncDiffTransport, SyncHelloTransport {
+  /// Creates a transport that talks to [baseUrl] with [origin].
   ///
-  /// [baseUrl] is an origin such as `http://127.0.0.1:8080` or
+  /// [baseUrl] is a server URL such as `http://127.0.0.1:8080` or
   /// `http://10.0.2.2:8080`. A path prefix such as `/api` is not supported:
-  /// paths are always `/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`.
+  /// paths are always `/v1/sync/hello`, `/v1/sync/push`, `/v1/sync/pull`,
+  /// and `/v1/sync/diff`. [origin] is the application contour (SPEC
+  /// section 1.5), not [baseUrl].
   HttpSyncTransport({
     required this.baseUrl,
+    required String origin,
     required this.tokenProvider,
     this.pushPullTimeout = kPushPullTimeout,
     this.liveHeaderTimeout = kLiveHeaderTimeout,
@@ -71,10 +79,14 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
     this.reconnectInterval = kReconnectInterval,
     this.reopenBeforeExpiry = kReopenBeforeExpiry,
     this.unreadableExpInterval = kUnreadableExpInterval,
-  }) : _client = http.Client();
+  }) : origin = requireUlsyncOrigin(origin),
+       _client = http.Client();
 
-  /// Origin of the sync server; path is ignored.
+  /// Server URL; path is ignored.
   final Uri baseUrl;
+
+  /// Application-contour origin sent as `Ulsync-Origin` on every request.
+  final String origin;
 
   /// Called before every HTTP request, including the one 401 retry.
   ///
@@ -120,6 +132,7 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       request.headers['Authorization'] = 'Bearer $token';
       request.headers['Content-Type'] = 'application/json';
       request.headers['Accept'] = 'application/json';
+      request.headers['Ulsync-Origin'] = origin;
       request.body = body;
       return request;
     });
@@ -138,6 +151,7 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       final request = http.Request('GET', _pullUri(query));
       request.headers['Authorization'] = 'Bearer $token';
       request.headers['Accept'] = 'application/json';
+      request.headers['Ulsync-Origin'] = origin;
       return request;
     });
     _throwIfHttpError(response);
@@ -162,6 +176,7 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       request.headers['Authorization'] = 'Bearer $token';
       request.headers['Content-Type'] = 'application/json';
       request.headers['Accept'] = 'application/json';
+      request.headers['Ulsync-Origin'] = origin;
       request.body = body;
       return request;
     });
@@ -171,6 +186,32 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
     }
     _throwIfHttpError(response);
     return _parseDiffVerdicts(response.body);
+  }
+
+  /// GETs `/v1/sync/hello`. HTTP 404 and 405 mean the endpoint is absent.
+  ///
+  /// Null is «unavailable», not a mismatch: an old server cannot refuse a
+  /// foreign application. HTTP `409` is [OriginMismatchException] with both
+  /// origins from the body. Other failures match [push] and [pull].
+  @override
+  Future<HelloResult?> hello(String origin) async {
+    _ensureOpen();
+    final response = await _sendWithAuthRetry((token) {
+      final request = http.Request('GET', _helloUri());
+      request.headers['Authorization'] = 'Bearer $token';
+      request.headers['Accept'] = 'application/json';
+      request.headers['Ulsync-Origin'] = origin;
+      return request;
+    });
+    final status = response.statusCode;
+    if (status == 404 || status == 405) {
+      return null;
+    }
+    if (status == 409) {
+      throw _parseOriginMismatch(response.body);
+    }
+    _throwIfHttpError(response);
+    return HelloResult.fromJson(_decodeObject(response.body, 'origin'));
   }
 
   /// Opens the live SSE feed.
@@ -207,6 +248,7 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       reopenBeforeExpiry: reopenBeforeExpiry,
       unreadableExpInterval: unreadableExpInterval,
       reconnectDelay: reconnectInterval,
+      origin: origin,
       isTransportClosed: () => _closed,
       onStopped: () {
         if (identical(_liveSession, session)) {
@@ -248,6 +290,8 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       baseUrl.replace(path: '/v1/sync/pull', queryParameters: query);
 
   Uri _diffUri() => baseUrl.replace(path: '/v1/sync/diff');
+
+  Uri _helloUri() => baseUrl.replace(path: '/v1/sync/hello');
 
   /// Reads a non-empty token or throws [UlsyncUnauthorized] without I/O.
   Future<String> _requireToken() async {
@@ -460,5 +504,25 @@ final class HttpSyncTransport implements SyncTransport, SyncDiffTransport {
       );
     }
     return Map<String, Object?>.from(decoded);
+  }
+
+  /// Parses SPEC section 3.5 `409` `origin_mismatch` body.
+  OriginMismatchException _parseOriginMismatch(String body) {
+    final map = _decodeObject(body, 'store_origin');
+    final store = map['store_origin'];
+    final request = map['request_origin'];
+    if (store is! String || store.isEmpty) {
+      throw const UlsyncProtocolException(
+        'Expected non-empty string for field: store_origin',
+        field: 'store_origin',
+      );
+    }
+    if (request is! String || request.isEmpty) {
+      throw const UlsyncProtocolException(
+        'Expected non-empty string for field: request_origin',
+        field: 'request_origin',
+      );
+    }
+    return OriginMismatchException(storeOrigin: store, requestOrigin: request);
   }
 }

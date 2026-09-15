@@ -85,6 +85,7 @@ UlsyncClient _client({
 }) {
   final client = UlsyncClient(
     baseUrl: Uri.parse('http://self-check.test'),
+    origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
     userScope: userScope,
     sourceId: sourceId,
     tokenProvider: () async => 'test-token',
@@ -363,6 +364,7 @@ void main() {
       await first.selfCheck(includeServer: false);
       final second = UlsyncClient(
         baseUrl: Uri.parse('http://self-check.test'),
+        origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
         userScope: 'alice',
         sourceId: 'device-b',
         tokenProvider: () async => 'test-token',

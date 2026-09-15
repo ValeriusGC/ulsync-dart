@@ -21,6 +21,11 @@ import 'package:ulsync_example/tap.dart';
 /// `example/README.md`.
 const String kDefaultBaseUrl = 'http://127.0.0.1:8080';
 
+/// Application-contour origin (SPEC section 1.5). Same string on every
+/// installation of this example; never minted per device.
+const String kUlsyncOrigin =
+    'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f';
+
 void main() {
   runApp(const UlsyncExampleApp());
 }
@@ -169,6 +174,7 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
       final store = await SembastMetadataStore.open(databasePath: databasePath);
       client = UlsyncClient(
         baseUrl: Uri.parse(baseUrlText),
+        origin: kUlsyncOrigin,
         userScope: user,
         sourceId: safeDevice,
         tokenProvider: () async =>
