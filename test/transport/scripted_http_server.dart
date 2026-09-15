@@ -13,6 +13,7 @@ final class RecordedRequest {
     required this.path,
     required this.query,
     required this.authorization,
+    required this.ulsyncOrigin,
     required this.body,
     required this.receivedAt,
   });
@@ -29,6 +30,9 @@ final class RecordedRequest {
   /// Raw `Authorization` header, or `null` if omitted.
   final String? authorization;
 
+  /// Raw `Ulsync-Origin` header, or `null` if omitted.
+  final String? ulsyncOrigin;
+
   /// UTF-8 body; empty for GET.
   final String body;
 
@@ -43,6 +47,7 @@ final class ScriptedReply {
     required this.status,
     required this.body,
     this.headers = const {},
+    this.path,
   }) : chunks = const [],
        closeAfter = null,
        holdOpen = false,
@@ -54,6 +59,7 @@ final class ScriptedReply {
     this.chunks = const [],
     this.closeAfter,
     this.holdOpen = false,
+    this.path,
   }) : status = 200,
        body = '',
        headers = const {},
@@ -61,7 +67,7 @@ final class ScriptedReply {
        sse = true;
 
   /// Destroy the socket before an HTTP response. Client sees a network error.
-  const ScriptedReply.drop()
+  const ScriptedReply.drop({this.path})
     : status = 0,
       body = '',
       headers = const {},
@@ -94,6 +100,12 @@ final class ScriptedReply {
 
   /// When true, the reply is `text/event-stream`, even with an empty body.
   final bool sse;
+
+  /// When set, this reply is used only for that request path and does not
+  /// consume the sequential queue. `GET /v1/sync/hello` without a matching
+  /// reply is `404`, so existing push/pull scripts keep working against a
+  /// current client that always hellos first (old-server behaviour).
+  final String? path;
 
   /// Writes this reply onto [request].
   Future<void> apply(HttpRequest request) async {
@@ -165,6 +177,7 @@ final class ScriptedHttpServer {
   final List<ScriptedReply> _replies;
   final List<RecordedRequest> _requests = [];
   final Map<int, Completer<void>> _waiters = {};
+  final Set<int> _usedReplyIndexes = {};
 
   /// Origin for `HttpSyncTransport.baseUrl`.
   Uri get baseUrl =>
@@ -199,6 +212,35 @@ final class ScriptedHttpServer {
   /// Closes the listener; in-flight SSE holds are aborted.
   Future<void> close() => _server.close(force: true);
 
+  /// Path-tagged replies first; untagged sequential otherwise.
+  ///
+  /// Unscripted `GET /v1/sync/hello` is `404` and does not consume push/pull
+  /// replies, matching an old server that lacks the endpoint.
+  ScriptedReply _pickReply(String path) {
+    for (var i = 0; i < _replies.length; i++) {
+      if (_usedReplyIndexes.contains(i)) {
+        continue;
+      }
+      if (_replies[i].path == path) {
+        _usedReplyIndexes.add(i);
+        return _replies[i];
+      }
+    }
+    if (path == '/v1/sync/hello') {
+      return const ScriptedReply.json(status: 404, body: 'not found');
+    }
+    for (var i = 0; i < _replies.length; i++) {
+      if (_usedReplyIndexes.contains(i)) {
+        continue;
+      }
+      if (_replies[i].path == null) {
+        _usedReplyIndexes.add(i);
+        return _replies[i];
+      }
+    }
+    return const ScriptedReply.json(status: 500, body: '{}');
+  }
+
   void _listen() {
     _server.listen((request) {
       unawaited(_handle(request));
@@ -212,6 +254,7 @@ final class ScriptedHttpServer {
       path: request.uri.path,
       query: request.uri.queryParameters,
       authorization: request.headers.value(HttpHeaders.authorizationHeader),
+      ulsyncOrigin: request.headers.value('Ulsync-Origin'),
       body: body,
       receivedAt: DateTime.now(),
     );
@@ -221,10 +264,7 @@ final class ScriptedHttpServer {
       waiter.complete();
     }
 
-    final index = _requests.length - 1;
-    final reply = index < _replies.length
-        ? _replies[index]
-        : const ScriptedReply.json(status: 500, body: '{}');
+    final reply = _pickReply(request.uri.path);
     try {
       await reply.apply(request);
     } catch (_) {
