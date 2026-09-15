@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-15 07:24:00 +0300  
-**Version:** 14  
+**Updated:** 2026-09-15 14:18:21 +0300  
+**Version:** 15  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Required `UlsyncClient.origin` (SPEC section 1.5). Empty or illegal
+  strings throw `ArgumentError` at construction; the library never mints
+  the value. `GET /v1/sync/hello` runs before `selfCheck` and before
+  `live` opens. `409` is `OriginMismatchException` (foreign store). An
+  old server without the hello endpoint (`404` / `405`) keeps working as
+  in round 1a. `HttpSyncTransport` sends `Ulsync-Origin` on hello, push,
+  pull, diff, and live.
 - `UlsyncClient.selfCheck`: three-phase anti-entropy (installation identity,
   application ids vs metadata, metadata vs `POST /v1/sync/diff`). Runs once
   per client on the first `syncOnce`. Marking an already-known row does not
