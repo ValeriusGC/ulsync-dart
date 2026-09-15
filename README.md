@@ -443,13 +443,11 @@ Failures are typed so `UlsyncClient.syncOnce` can decide retry versus stop:
 - `UlsyncProtocolException` means the bytes did not match the contract; it is
   not retried.
 
-After a live disconnect, the transport waits 1 second, then 2, 4, and so on,
-up to a **base** of 30 seconds, and then adds a random delay of up to that
-same base (full jitter). Capping the *total* at 30 seconds would squeeze
-jitter to zero at the ceiling and recreate the reconnect storm that jitter
-exists to prevent. The backoff counter resets only after a connection has
-stayed up for at least one minute; a connect-and-drop loop is not treated as
-success. Round 1 does not open `live=poll`.
+After a live disconnect, the client does what EventSource does in the
+browser: wait about 3 seconds, then try again. The wait does **not** grow.
+The first open is immediate. If headers never arrive, this try stops after
+5 seconds and the 3-second pause starts. Push and pull still wait up to 30
+seconds for a slow round trip.
 
 The transport does not store a cursor. Each (re)open of the live feed calls
 `appliedSince` and sends that integer as `since`. That callback must return

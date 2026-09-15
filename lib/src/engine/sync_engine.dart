@@ -919,12 +919,12 @@ final class UlsyncClient {
     );
   }
 
-  /// Opens the transport live feed and ingests each message under the lock.
+  /// Opens the live feed. Does not pull first: if the server is down, a pull
+  /// would throw and nothing would keep trying. Catch-up is [syncOnce].
   Future<void> _runLive() async {
     try {
       await _serialized(() async {
         await _ensureCursorLoaded();
-        await _reconcileCursorIfAhead();
       });
       if (_closed) {
         return;

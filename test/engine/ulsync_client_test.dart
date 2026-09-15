@@ -605,6 +605,24 @@ void main() {
     },
   );
 
+  test('live still opens when pull fails because the server is down', () async {
+    final h = await _Harness.open();
+    await h.store.writeCursor('alice', 18, 1000);
+    h.fake.onPull = ({required int since, int? limit}) async {
+      throw const UlsyncNetworkException('server down');
+    };
+    Object? liveError;
+    h.client.live().listen(
+      (_) {},
+      onError: (Object e, StackTrace _) {
+        liveError = e;
+      },
+    );
+    await _pumpUntil(() => h.fake.appliedSince != null);
+    expect(liveError, isNull);
+    expect(h.fake.appliedSinceReads, isNotEmpty);
+  });
+
   test(
     'syncOnce replays from since=0 when local cursor is ahead of server feed',
     () async {

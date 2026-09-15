@@ -43,10 +43,9 @@ final class LiveSession {
     required this._controller,
     required this._pushPullTimeout,
     required this._silenceTimeout,
-    required this._stableConnection,
     required this._reopenBeforeExpiry,
     required this._unreadableExpInterval,
-    required this._backoffDelay,
+    required this._reconnectDelay,
     required this._isTransportClosed,
     required this._onStopped,
     this.onConnectionState,
@@ -74,17 +73,14 @@ final class LiveSession {
   /// half-open socket that TCP will not notice for minutes.
   final Duration _silenceTimeout;
 
-  /// Connections shorter than this do not reset the backoff index.
-  final Duration _stableConnection;
-
   /// Reopen this long before JWT `exp`, not after.
   final Duration _reopenBeforeExpiry;
 
   /// Fallback when `exp` cannot be read: do not spin, do not wait forever.
   final Duration _unreadableExpInterval;
 
-  /// Jittered delay for [failedAttempt] (0 = first reconnect).
-  final Duration Function(int failedAttempt) _backoffDelay;
+  /// Pause after a failed live try. EventSource: a few seconds, does not grow.
+  final Duration _reconnectDelay;
 
   /// True after the transport has been closed.
   final bool Function() _isTransportClosed;
@@ -98,9 +94,6 @@ final class LiveSession {
 
   /// Set by [stop] and by a terminal failure.
   bool _stopped = false;
-
-  /// Backoff index; 0 for the first reconnect. Incremented after a drop.
-  int _failedAttempt = 0;
 
   /// Completes early when [stop] interrupts a backoff sleep.
   Completer<void>? _sleepGate;
@@ -185,14 +178,14 @@ final class LiveSession {
             return;
           }
           _emitConnection(LiveConnectionState.lost);
-          await _backoffAfterFailure();
+          await _waitThenRetry();
           break headerAttempt;
         } on http.ClientException {
           if (_halted) {
             return;
           }
           _emitConnection(LiveConnectionState.lost);
-          await _backoffAfterFailure();
+          await _waitThenRetry();
           break headerAttempt;
         } catch (e) {
           if (_halted) {
@@ -203,7 +196,7 @@ final class LiveSession {
             return;
           }
           _emitConnection(LiveConnectionState.lost);
-          await _backoffAfterFailure();
+          await _waitThenRetry();
           break headerAttempt;
         }
 
@@ -252,12 +245,11 @@ final class LiveSession {
             return;
           }
           _emitConnection(LiveConnectionState.lost);
-          await _backoffAfterFailure();
+          await _waitThenRetry();
           break headerAttempt;
         }
 
         _emitConnection(LiveConnectionState.restored);
-        final connectedAt = DateTime.now();
         final end = await _consumeBody(streamed, workingToken);
         if (_halted) {
           return;
@@ -271,20 +263,14 @@ final class LiveSession {
             );
             return;
           case _BodyEnd.exp:
-            if (DateTime.now().difference(connectedAt) >= _stableConnection) {
-              _failedAttempt = 0;
-            }
-            // Reopen immediately; do not increment the backoff index.
+            // Token is about to expire; open a new stream now.
             break headerAttempt;
           case _BodyEnd.dropped:
           case _BodyEnd.silence:
             if (!_halted) {
               _emitConnection(LiveConnectionState.lost);
             }
-            if (DateTime.now().difference(connectedAt) >= _stableConnection) {
-              _failedAttempt = 0;
-            }
-            await _backoffAfterFailure();
+            await _waitThenRetry();
             break headerAttempt;
         }
       }
@@ -435,12 +421,12 @@ final class LiveSession {
     );
   }
 
-  Future<void> _backoffAfterFailure() async {
+  /// EventSource: wait a few seconds, then try again. The wait does not grow.
+  Future<void> _waitThenRetry() async {
     if (_halted) {
       return;
     }
-    await _sleep(_backoffDelay(_failedAttempt));
-    _failedAttempt++;
+    await _sleep(_reconnectDelay);
   }
 
   Future<void> _sleep(Duration delay) async {

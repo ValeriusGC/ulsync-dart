@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-14 17:22:00 +0300  
-**Version:** 13  
+**Updated:** 2026-09-15 07:24:00 +0300  
+**Version:** 14  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -30,6 +30,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Self-check of unknown local ids uses time `1` (not `0`): older than any
   real edit, and the server accepts it. Time `0` was rejected on push, so
   G4 never healed.
+- Live reconnect waits a fixed few seconds like EventSource; the wait does
+  not grow. Live headers time out after 5 seconds when the server is down.
+  `live()` no longer pulls before opening the feed.
 - Example application: tap counter with two macOS processes, per-device
   metadata file, and an Offline switch; memo text field removed.
 
@@ -47,8 +50,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Typed transport failures split by whether the caller should retry
   (`UlsyncNetworkException`, `UlsyncServerException`, `UlsyncUnauthorized`,
   `UlsyncRequestRejected`).
-- Live feed reconnects with a silence watchdog and jittered backoff; the
-  outward stream does not complete on a dropped socket.
+- Live feed reconnects with a silence watchdog and a fixed pause between
+  tries; the outward stream does not complete on a dropped socket.
 - Live feed reopens 60 seconds before JWT `exp` (the claim is read; the
   signature is not verified). Unreadable `exp` falls back to 30 minutes.
 - Per-user metadata store on sembast (`SembastMetadataStore`, `EntityState`):
