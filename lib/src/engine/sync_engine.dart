@@ -5,6 +5,7 @@
 library;
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import '../protocol/envelope.dart';
 import '../protocol/errors.dart';
@@ -19,16 +20,23 @@ import 'self_check_report.dart';
 import 'sync_event.dart';
 import 'sync_report.dart';
 
-/// Wire `part` for every envelope in round 1.
+/// Default wire `part` for a complete snapshot of a record.
 ///
-/// SPEC section 1.1 and triad plan §13.10 allow only `full`.
+/// SPEC section 1.1: identity is `(id, part)`. `full` is the complete
+/// snapshot. Any other non-empty string is an application-defined slice.
+/// The library keeps no registry of names and does not treat `done` or
+/// `deleted` as reserved. This is the default for [UlsyncClient.write]
+/// and [UlsyncClient.markChanged], not the only legal value.
 const String kEnvelopePart = 'full';
 
 /// Wire `payload_encoding`. Always `json` in round 1, even when the bytes
 /// are not UTF-8: the server copies the string and does not interpret it.
 const String kPayloadEncoding = 'json';
 
-/// Wire `flags`. Round 1 sends `0`; deletion bits are a later round.
+/// Wire `flags`. This version always sends `0`.
+///
+/// Hiding a record is an application part, not a bit in this field.
+/// There is no tombstone type.
 const int kFlags = 0;
 
 /// Maximum dirty rows drained per [UlsyncClient.syncOnce].
@@ -57,7 +65,9 @@ final class _SyncCounters {
   /// Pull envelopes seen this pass, including skips.
   int pulled = 0;
 
-  /// [EntityAdapter.apply] calls this pass (not live).
+  /// [EntityAdapter.apply] / [EntityAdapter.applyPart] calls this pass
+  /// (not live). An unknown part with no `applyPart` does not increment
+  /// this: the domain was not written.
   int applied = 0;
 }
 
@@ -231,13 +241,25 @@ final class UlsyncClient {
   /// it. Use this only when the application cannot persist through the
   /// library (for example a later self-check pass).
   ///
+  /// [part] names the envelope cell. Default [kEnvelopePart] (`full`).
+  /// The mark is keyed `(id, part)` the same way metadata already is.
+  /// A blank value after trim is [ArgumentError]. This method does not
+  /// require [EntityAdapter.encodePart]: it is the primitive that can
+  /// mark a slice the next push will refuse to encode. Prefer [write],
+  /// which throws [StateError] before marking when the encoder is missing.
+  ///
   /// The engine owns the revision. The application must not mint it: a stale
   /// number loses a last-write-wins tie and the edit disappears silently.
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
   /// (the store is not touched). Throws [StateError] after [close], or when
   /// called from inside the persist callback of [write].
-  Future<void> markChanged({required String entityType, required String id}) {
+  Future<void> markChanged({
+    required String entityType,
+    required String id,
+    String part = kEnvelopePart,
+  }) {
     _ensureOpen();
+    final trimmedPart = _requireNonEmpty(part, 'part');
     return _serialized(() async {
       _ensureOpen();
       final adapter = _adapters[entityType];
@@ -252,6 +274,7 @@ final class UlsyncClient {
         entityType: entityType,
         id: id,
         adapter: adapter,
+        part: trimmedPart,
       );
     });
   }
@@ -262,9 +285,18 @@ final class UlsyncClient {
   /// written **before** [persist] runs. The two stores (library metadata and
   /// the application's database) cannot share a transaction, so a crash in
   /// the middle must choose a side: a mark without data is healed on the
-  /// next push (`load` returns `null` and the engine clears dirty). Data
-  /// without a mark is a silent permanent loss. That is why the order is
-  /// not reversed even when "write the row first" looks more natural.
+  /// next push (`load` or [EntityAdapter.encodePart] returns `null` and the
+  /// engine clears dirty). Data without a mark is a silent permanent loss.
+  /// That is why the order is not reversed even when "write the row first"
+  /// looks more natural.
+  ///
+  /// [part] names the envelope cell. Default [kEnvelopePart] (`full`).
+  /// Identity is `(id, part)`: a checkbox and a hide flag on the same
+  /// record are two rows, and last-write-wins does not cross between
+  /// them. A blank value after trim is [ArgumentError]. When [part] is not
+  /// `full` and the adapter has no [EntityAdapter.encodePart], this throws
+  /// [StateError] **before** the mark so [persist] does not run and an
+  /// unsendable row is not left behind.
   ///
   /// The same serial lock covers [persist]. Releasing it between the mark
   /// and the application write would let a concurrent [syncOnce] observe
@@ -286,8 +318,10 @@ final class UlsyncClient {
     required String entityType,
     required String id,
     required Future<T> Function() persist,
+    String part = kEnvelopePart,
   }) {
     _ensureOpen();
+    final trimmedPart = _requireNonEmpty(part, 'part');
     return _serialized(() async {
       _ensureOpen();
       final adapter = _adapters[entityType];
@@ -298,10 +332,18 @@ final class UlsyncClient {
           'no adapter registered',
         );
       }
+      if (trimmedPart != kEnvelopePart && adapter.encodePart == null) {
+        throw StateError(
+          'EntityAdapter.encodePart is required to write part '
+          '"$trimmedPart"; without it the engine would mark a row it '
+          'cannot encode. The persist callback did not run.',
+        );
+      }
       await _markChangedLocked(
         entityType: entityType,
         id: id,
         adapter: adapter,
+        part: trimmedPart,
       );
       // The mark is written before entering the persist zone so this
       // method's own [_serialized] call is not treated as re-entry.
@@ -309,20 +351,24 @@ final class UlsyncClient {
     });
   }
 
-  /// Writes a dirty metadata row for [id]. Caller already holds [_serialized].
+  /// Writes a dirty metadata row for ([id], [part]). Caller already holds
+  /// [_serialized].
   ///
   /// Shared by [markChanged] and [write] so the two public marks cannot
   /// drift. [adapter] is already resolved; this method does not look it up.
+  /// [part] is the trimmed cell name; last-write-wins and the send queue
+  /// both key this row, not a neighbour with the same [id].
   Future<void> _markChangedLocked({
     required String entityType,
     required String id,
     required EntityAdapter<dynamic> adapter,
+    required String part,
   }) async {
     final existing = await store.stateOf(
       userScope: userScope,
       entityType: entityType,
       id: id,
-      part: kEnvelopePart,
+      part: part,
     );
     final now = DateTime.now().millisecondsSinceEpoch;
     await store.put(
@@ -330,7 +376,7 @@ final class UlsyncClient {
         userScope: userScope,
         entityType: entityType,
         id: id,
-        part: kEnvelopePart,
+        part: part,
         createdAtMs: existing?.createdAtMs ?? now,
         lastEditedAtMs: now,
         revision: (existing?.revision ?? 0) + 1,
@@ -818,6 +864,11 @@ final class UlsyncClient {
   }
 
   /// Sends up to [kPushBatchLimit] dirty rows, one envelope per POST.
+  ///
+  /// `full` still uses [EntityAdapter.load] and [EntityAdapter.encode].
+  /// Any other [EntityState.part] uses [EntityAdapter.encodePart]. A
+  /// `null` payload clears dirty without POST. The loop body still posts
+  /// one envelope; a later change batches that POST, not this queue.
   Future<void> _pushDirty(_SyncCounters counters) async {
     final batch = await store.dirtyBatch(
       userScope: userScope,
@@ -830,8 +881,8 @@ final class UlsyncClient {
         await _clearDirty(row);
         continue;
       }
-      final value = await adapter.load(row.id);
-      if (value == null) {
+      final payload = await _payloadForDirtyRow(row, adapter);
+      if (payload == null) {
         await _clearDirty(row);
         continue;
       }
@@ -848,10 +899,10 @@ final class UlsyncClient {
         flags: kFlags,
         schemaVersion: row.schemaVersion,
         payloadEncoding: kPayloadEncoding,
-        payload: adapter.encodeValue(value),
+        payload: payload,
       );
-      // Round 2 will POST a batch; the queue is already a list. One envelope
-      // per request is the round-1 server limit (max_envelopes_per_push: 1).
+      // One envelope per request remains the round-1 server limit
+      // (max_envelopes_per_push: 1). Batching the POST is a later change.
       final results = await _transport.push([envelope]);
       final result = _pushResultFor(results, envelope.id);
       await _clearDirty(row);
@@ -860,6 +911,40 @@ final class UlsyncClient {
         counters.accepted++;
       }
     }
+  }
+
+  /// Resolves payload bytes for a dirty [row], or `null` when there is
+  /// nothing to send.
+  ///
+  /// [kEnvelopePart] uses [EntityAdapter.load] then [EntityAdapter.encode].
+  /// Any other part uses [EntityAdapter.encodePart]. Returning `null` is
+  /// the same contract as `load` returning `null`: the caller clears dirty
+  /// without POST.
+  ///
+  /// Throws [StateError] when [row.part] is not `full` and [encodePart] is
+  /// missing. [write] already refuses that case before marking; this
+  /// guards [markChanged] so an unsendable row cannot be POSTed as a
+  /// decoded full snapshot. Dirty is left set so the programming error
+  /// is not silently dropped.
+  Future<Uint8List?> _payloadForDirtyRow(
+    EntityState row,
+    EntityAdapter<dynamic> adapter,
+  ) async {
+    if (row.part == kEnvelopePart) {
+      final value = await adapter.load(row.id);
+      if (value == null) {
+        return null;
+      }
+      return adapter.encodeValue(value);
+    }
+    final encodePart = adapter.encodePart;
+    if (encodePart == null) {
+      throw StateError(
+        'EntityAdapter.encodePart is required to push part "${row.part}" '
+        'of ${row.entityType}/${row.id}',
+      );
+    }
+    return encodePart(row.id, row.part);
   }
 
   /// Pulls pages until a short page or a stuck cursor.
@@ -887,10 +972,19 @@ final class UlsyncClient {
 
   /// Applies one incoming envelope or skips it; always eligible to move cursor.
   ///
-  /// Last-write-wins skips and unknown types must **not** call
-  /// [SembastMetadataStore.applyIncoming]: that method always writes
-  /// [EntityState] and would overwrite a newer local row with an older
-  /// envelope.
+  /// Last-write-wins compares **only** inside `(id, part)`. A newer `done`
+  /// does not beat a local `deleted`, and a newer `full` does not restore
+  /// a hidden row — those are different cells. Skips and unknown types must
+  /// **not** call [SembastMetadataStore.applyIncoming]: that method always
+  /// writes [EntityState] and would overwrite a newer local row with an
+  /// older envelope.
+  ///
+  /// `full` uses [EntityAdapter.decode] then [EntityAdapter.apply]. Any
+  /// other part uses [EntityAdapter.applyPart]. When [applyPart] is
+  /// omitted, the domain is not touched, the cursor still moves, and the
+  /// part's metadata is stored so the feed is not replayed forever.
+  /// Exchange does not fail: an older build must ignore a slice it does
+  /// not understand.
   Future<void> _ingest(
     Envelope envelope, {
     required bool countInReport,
@@ -927,12 +1021,13 @@ final class UlsyncClient {
       await _advanceCursor(seq);
       return;
     }
-    final value = adapter.decode(envelope.payload, envelope.schemaVersion);
-    await adapter.applyValue(value);
-    if (countInReport) {
-      counters?.applied++;
+    final wroteDomain = await _applyIncomingDomain(adapter, envelope);
+    if (wroteDomain) {
+      if (countInReport) {
+        counters?.applied++;
+      }
+      await beforePersistIncoming?.call();
     }
-    await beforePersistIncoming?.call();
     final now = DateTime.now().millisecondsSinceEpoch;
     final previousCursor = _appliedCursor;
     await store.applyIncoming(
@@ -954,14 +1049,39 @@ final class UlsyncClient {
     if (seq > _appliedCursor) {
       _appliedCursor = seq;
     }
-    _emit(
-      SyncApplied([
-        SyncedEntity(entityType: envelope.entityType, id: envelope.id),
-      ]),
-    );
+    if (wroteDomain) {
+      _emit(
+        SyncApplied([
+          SyncedEntity(entityType: envelope.entityType, id: envelope.id),
+        ]),
+      );
+    }
     if (_appliedCursor > previousCursor) {
       _emit(SyncCursorAdvanced(_appliedCursor));
     }
+  }
+
+  /// Writes [envelope] into the application store, or skips the domain.
+  ///
+  /// Returns `true` when [EntityAdapter.apply] or [EntityAdapter.applyPart]
+  /// ran. Returns `false` when [envelope.part] is not `full` and
+  /// [applyPart] is omitted: the caller still persists metadata and
+  /// advances the cursor. Never compares one part against another.
+  Future<bool> _applyIncomingDomain(
+    EntityAdapter<dynamic> adapter,
+    Envelope envelope,
+  ) async {
+    if (envelope.part == kEnvelopePart) {
+      final value = adapter.decode(envelope.payload, envelope.schemaVersion);
+      await adapter.applyValue(value);
+      return true;
+    }
+    final applyPart = adapter.applyPart;
+    if (applyPart == null) {
+      return false;
+    }
+    await applyPart(envelope.id, envelope.part, envelope.payload);
+    return true;
   }
 
   /// Moves the persisted cursor forward when [serverSeq] is strictly greater.
