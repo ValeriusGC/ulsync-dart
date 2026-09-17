@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-15 14:18:21 +0300  
-**Version:** 15  
+**Updated:** 2026-09-17 15:30:57 +0300  
+**Version:** 16  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Named envelope parts besides `full`. `UlsyncClient.write` and
+  `markChanged` take an optional `part` (default `full`). Optional
+  `EntityAdapter.encodePart` / `applyPart` send and apply those slices
+  as independent cells. `apply` of a full snapshot must not write slice
+  fields. There is no tombstone type; hide is an application part, not a
+  `flags` bit.
 - Required `UlsyncClient.origin` (SPEC section 1.5). Empty or illegal
   strings throw `ArgumentError` at construction; the library never mints
   the value. `GET /v1/sync/hello` runs before `selfCheck` and before

@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-15 14:18:21 +0300  
-**Version:** 13  
+**Updated:** 2026-09-17 15:30:57 +0300  
+**Version:** 14  
 **Document type:** readme
 
 ## What this is
@@ -149,7 +149,10 @@ from the server with no adapter is skipped, the cursor still advances,
 and `SyncUnknownType` is emitted — a foreign type must not stop sync of
 the types you do own. Optional `listIds` lets the self-check compare
 application data with library metadata; without it that phase reports
-unavailable and everything else still works.
+unavailable and everything else still works. Optional `encodePart` /
+`applyPart` send and apply named envelope parts other than `full`
+(see **Named parts**). Existing adapters without those fields keep
+compiling.
 
 **`apply` must be idempotent.** The application store and the metadata
 database are different databases. There is no transaction that covers
@@ -260,6 +263,67 @@ Then call `syncOnce` when the application decides it is a good time
 The first `syncOnce` of each client names `origin` to the server, then
 runs the self-check.
 
+## Named parts
+
+An envelope is one cell: identity on the wire is `(id, part)`, not
+`id` alone. `full` is the complete snapshot of the record. Any other
+non-empty string is a slice the **application** names. The library
+does not keep a registry of those names, does not know “trash”, and
+does not treat `done` or `deleted` as reserved protocol values — those
+two strings are examples an app may choose, nothing more.
+
+Last-write-wins already compares inside one `(id, part)` pair and
+does not jump to a neighbour. That is not enough in the domain. The
+library does not store part bodies to replay “snapshot, then newer
+slices”. Each winning envelope is applied to **its own columns** on
+arrival. `EntityAdapter.apply` runs only for `full` and must write
+only snapshot fields (the title, the body). `applyPart` runs for every
+other name and must write only that slice (the checkbox, the hide
+flag). If `apply` of `full` also writes those flags, a newer snapshot
+clears them and the independence the wire already kept is lost in the
+application store. The library cannot see that bug; the adapter is
+the contract.
+
+`UlsyncClient.write` takes an optional named `part` (default `full`).
+The dirty mark is keyed the same way metadata already is: `(id, part)`.
+A blank `part` after trim is `ArgumentError`. `markChanged` takes the
+same optional argument so the primitive cannot mark `full` while the
+application thinks it edited another slice.
+
+Push: `part == full` still uses `load` then `encode`. Any other part
+calls `encodePart`. `encodePart` returning `null` is the same contract
+as `load` returning `null`: the dirty flag is cleared and there is no
+POST. Calling `write(part: x)` with `x != full` when `encodePart` is
+omitted throws `StateError` **before** the dirty mark, and `persist`
+does not run — a missing encoder must not leave a row that cannot be
+sent.
+
+Pull and live: `part == full` still uses `decode` then `apply`. Any
+other part calls `applyPart`. If `applyPart` is omitted, the envelope
+does **not** fail the exchange: the cursor still advances, the part’s
+metadata is stored so the same bytes are not replayed forever, and
+the application store is left untouched. That is how an older build
+ignores a slice it does not yet understand.
+
+This step still sends **one envelope per POST**. Batching the dirty
+queue is a later change. There is no tombstone type and no hide bit
+in `flags` (`flags` stay `0`).
+
+```dart
+await client.write(
+  entityType: 'task',
+  id: task.id,
+  persist: () => db.upsertTitle(task),
+);
+
+await client.write(
+  entityType: 'task',
+  id: task.id,
+  part: 'done',
+  persist: () => db.writeDone(task.id, true),
+);
+```
+
 ## Self-check
 
 The library can push what it marked and pull what appeared on the
@@ -335,8 +399,10 @@ in `SembastMetadataStore`.
 ## Limitations of round 1
 
 - One envelope per `POST /v1/sync/push`. The dirty queue is already a
-  list; round 2 changes the **body** of the push loop, not the queue.
-- No deletion, no tombstones, no `part` other than `full`.
+  list; a later change batches the **body** of the push loop, not the
+  queue. Named parts in this version still travel one POST each.
+- There is no tombstone type. Hiding a record is an application part
+  the library does not interpret. `flags` stay `0`.
 - No payload compression, no clock-skew correction, no content schema
   migrations inside the library.
 - The library does not call `syncOnce` on a timer. The application knows
