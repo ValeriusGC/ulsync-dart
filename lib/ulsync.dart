@@ -2,13 +2,14 @@
 ///
 /// See the README for setup and the `protocol/` submodule for the wire format.
 ///
-/// Applications talk to [UlsyncClient], [EntityAdapter], [SyncReport], and
-/// [SyncEvent]. Wire envelopes are not part of the sync event stream.
+/// Applications talk to [UlsyncClient], [EntityAdapter], [WriteOp],
+/// [SyncReport], and [SyncEvent]. Related edits use [UlsyncClient.writeAll].
+/// Wire envelopes are not part of the sync event stream.
 /// Live-feed line parsing stays internal.
 library;
 
 export 'src/engine/entity_adapter.dart' show EntityAdapter;
-export 'src/engine/sync_engine.dart' show UlsyncClient;
+export 'src/engine/sync_engine.dart' show UlsyncClient, WriteOp;
 export 'src/engine/self_check_report.dart' show SelfCheckReport;
 export 'src/protocol/origin.dart' show OriginMismatchException;
 export 'src/engine/sync_event.dart'
