@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-17 16:27:26 +0300  
-**Version:** 17  
+**Updated:** 2026-09-17 17:05:37 +0300  
+**Version:** 18  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -41,6 +41,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   head (for example after a server-side store reset): compare `L` to `H` via
   `pull(since: 0)`, reset local cursor when `L > H`, replay from `since=0`
   without mutating the server.
+- Example application: two-window self-hosted to-do with done, trash,
+  restore, session strip (host, not token), Immich-style pairing, and
+  **Move done to trash** via `writeAll`. Tap journal removed.
 
 ### Changed
 
@@ -55,8 +58,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Live reconnect waits a fixed few seconds like EventSource; the wait does
   not grow. Live headers time out after 5 seconds when the server is down.
   `live()` no longer pulls before opening the feed.
-- Example application: tap counter with two macOS processes, per-device
-  metadata file, and an Offline switch; memo text field removed.
 
 ## [0.1.0] - 2026-09-04
 
