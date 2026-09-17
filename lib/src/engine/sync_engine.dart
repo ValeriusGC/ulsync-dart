@@ -2,6 +2,7 @@
 ///
 /// Applications import [UlsyncClient] from `package:ulsync/ulsync.dart`.
 /// Envelopes never leave this library as [SyncEvent] payloads.
+/// @docImport '../transport/exceptions.dart';
 library;
 
 import 'dart:async';
@@ -39,11 +40,14 @@ const String kPayloadEncoding = 'json';
 /// There is no tombstone type.
 const int kFlags = 0;
 
-/// Maximum dirty rows drained per [UlsyncClient.syncOnce].
+/// Maximum dirty rows posted in one [UlsyncClient.syncOnce] drain.
 ///
-/// Round 2 changes the **body** of the push loop (one POST with a batch),
-/// not the queue shape. That is the promise in triad plan section 9.
-const int kPushBatchLimit = 50;
+/// Matches the SPEC maximum for push, pull `limit`, and diff (500), so a
+/// hundred-row related edit leaves in one POST. The previous value 50 was
+/// the round-1 drain size while the loop still posted one envelope per
+/// request. A lower drain now would split a hundred-row [UlsyncClient.writeAll]
+/// across two [UlsyncClient.syncOnce] passes.
+const int kPushBatchLimit = 500;
 
 /// Page size for [SyncTransport.pull]. A full page triggers another request.
 const int kPullPageLimit = 100;
@@ -71,20 +75,63 @@ final class _SyncCounters {
   int applied = 0;
 }
 
-/// Zone key set while [UlsyncClient.write]'s persist callback runs.
+/// Zone key set while a [UlsyncClient.write] or [UlsyncClient.writeAll]
+/// persist callback runs.
 ///
 /// Nested [UlsyncClient] calls would wait forever on the serial lock; the
 /// lock helper throws [StateError] instead of hanging.
 final Object _writeZoneKey = Object();
 
+/// One persist step of a [UlsyncClient.writeAll] list.
+///
+/// A related edit ("move done to trash") is several persist callbacks
+/// that must not be visible to live sync until every mark is written.
+/// [UlsyncClient.writeAll] holds the same lock as a single
+/// [UlsyncClient.write] for the whole list, so the feed cannot POST the
+/// first five while item 100 is still being persisted. This type does
+/// not open a database transaction: the application store and the
+/// metadata file remain two files, so a throwing persist on item 5
+/// leaves 1–5 marked and 6…N not started.
+final class WriteOp {
+  /// Creates one persist step of a related edit.
+  const WriteOp({
+    required this.entityType,
+    required this.id,
+    required this.persist,
+    this.part = kEnvelopePart,
+  });
+
+  /// Adapter key.
+  ///
+  /// An unknown name throws [ArgumentError] before this item's mark and
+  /// persist; earlier items in the same [UlsyncClient.writeAll] have
+  /// already run.
+  final String entityType;
+
+  /// Wire `id` of the record.
+  final String id;
+
+  /// Envelope cell. Default [kEnvelopePart] (`full`).
+  ///
+  /// Identity is `(id, part)`. A blank value after trim is [ArgumentError]
+  /// at [UlsyncClient.writeAll], not at construction.
+  final String part;
+
+  /// Application write for this item.
+  ///
+  /// Runs after the dirty mark, under the serial lock. Must not call
+  /// [UlsyncClient] methods.
+  final Future<void> Function() persist;
+}
+
 /// End-to-end last-write-wins client: queue, pull, live, one lock.
 ///
 /// The application records local edits with [write] (mark first, persist
-/// second, same lock). [markChanged] remains as a low-level primitive.
-/// [syncOnce] and [live] move data. The first network action of each
-/// instance is SPEC section 3.5 hello, then the first [syncOnce] runs
-/// [selfCheck]. Protocol, HTTP, cursor, and the send queue stay
-/// inside.
+/// second, same lock) or [writeAll] for one related action that touches
+/// many rows. [markChanged] remains as a low-level primitive. [syncOnce]
+/// and [live] move data. The first network action of each instance is
+/// SPEC section 3.5 hello, then the first [syncOnce] runs [selfCheck].
+/// Protocol, HTTP, cursor, and the send queue stay inside.
 final class UlsyncClient {
   /// Creates a client bound to one user, one device, one origin, and one
   /// metadata store.
@@ -223,12 +270,14 @@ final class UlsyncClient {
 
   /// Mutex tail. Each [_serialized] call waits for this, then replaces it.
   ///
-  /// Covers [markChanged], the whole of [write] including its persist
-  /// callback, the whole of [syncOnce], and **one** live message — not the
-  /// live subscription itself. Holding the lock for the lifetime of [live]
-  /// would make [syncOnce] wait forever. Releasing it between the dirty mark
-  /// of [write] and persist would let [syncOnce] clear the mark after
-  /// `load` returned `null`.
+  /// Covers [markChanged], the whole of [write] and [writeAll] including
+  /// every persist callback, the whole of [syncOnce], and **one** live
+  /// message — not the live subscription itself. Holding the lock for the
+  /// lifetime of [live] would make [syncOnce] wait forever. Releasing it
+  /// between the dirty mark of [write] and persist would let [syncOnce]
+  /// clear the mark after `load` returned `null`. Releasing it between
+  /// items of [writeAll] would let the live feed POST the first rows of a
+  /// related edit.
   Future<void> _tail = Future<void>.value();
 
   /// Records a local edit: bumps revision, sets dirty, writes metadata.
@@ -252,7 +301,7 @@ final class UlsyncClient {
   /// number loses a last-write-wins tie and the edit disappears silently.
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
   /// (the store is not touched). Throws [StateError] after [close], or when
-  /// called from inside the persist callback of [write].
+  /// called from inside the persist callback of [write] or [writeAll].
   Future<void> markChanged({
     required String entityType,
     required String id,
@@ -312,8 +361,8 @@ final class UlsyncClient {
   ///
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
   /// (the store is not touched, [persist] does not run). Throws [StateError]
-  /// after [close], or when called from inside another [write]'s persist
-  /// callback.
+  /// after [close], or when called from inside another [write] or [writeAll]
+  /// persist callback.
   Future<T> write<T>({
     required String entityType,
     required String id,
@@ -324,37 +373,92 @@ final class UlsyncClient {
     final trimmedPart = _requireNonEmpty(part, 'part');
     return _serialized(() async {
       _ensureOpen();
-      final adapter = _adapters[entityType];
-      if (adapter == null) {
-        throw ArgumentError.value(
-          entityType,
-          'entityType',
-          'no adapter registered',
-        );
-      }
-      if (trimmedPart != kEnvelopePart && adapter.encodePart == null) {
-        throw StateError(
-          'EntityAdapter.encodePart is required to write part '
-          '"$trimmedPart"; without it the engine would mark a row it '
-          'cannot encode. The persist callback did not run.',
-        );
-      }
-      await _markChangedLocked(
+      return _writeOneLocked(
         entityType: entityType,
         id: id,
-        adapter: adapter,
         part: trimmedPart,
+        persist: persist,
       );
-      // The mark is written before entering the persist zone so this
-      // method's own [_serialized] call is not treated as re-entry.
-      return await runZoned(persist, zoneValues: {_writeZoneKey: true});
     });
+  }
+
+  /// Applies several [write] operations under the same lock as a single [write].
+  ///
+  /// Use this for one user action that touches many rows ("move done to trash").
+  /// Live sync and [syncOnce] wait until every persist finished, so the feed
+  /// cannot POST the first five while the rest are still being marked.
+  ///
+  /// An empty list is a no-op, not an error. If persist of item 5 throws, items
+  /// 1–5 are marked dirty and 6…N have not started — the same contract as a
+  /// throwing single [write]. This method does not open a database transaction
+  /// across the application store and the metadata store: those are two files.
+  ///
+  /// Each item is checked, marked, and persisted in list order, with the same
+  /// adapter and [EntityAdapter.encodePart] rules as [write]. Do not call
+  /// [UlsyncClient] methods from [WriteOp.persist].
+  ///
+  /// Throws [ArgumentError] when an item names an unknown [WriteOp.entityType]
+  /// or a blank [WriteOp.part]. Throws [StateError] after [close], when called
+  /// from inside a persist callback, or when a named part has no encoder.
+  Future<void> writeAll(List<WriteOp> ops) {
+    if (ops.isEmpty) {
+      return Future<void>.value();
+    }
+    _ensureOpen();
+    return _serialized(() async {
+      _ensureOpen();
+      for (final op in ops) {
+        await _writeOneLocked(
+          entityType: op.entityType,
+          id: op.id,
+          part: _requireNonEmpty(op.part, 'part'),
+          persist: op.persist,
+        );
+      }
+    });
+  }
+
+  /// Marks one row and runs [persist] while the caller already holds
+  /// [_serialized].
+  ///
+  /// Shared by [write] and [writeAll] so a related edit cannot skip the
+  /// encode-part guard or release the lock between items. The dirty mark
+  /// is written before entering the persist zone so this method's own
+  /// [_serialized] wait is not treated as re-entry.
+  Future<T> _writeOneLocked<T>({
+    required String entityType,
+    required String id,
+    required String part,
+    required Future<T> Function() persist,
+  }) async {
+    final adapter = _adapters[entityType];
+    if (adapter == null) {
+      throw ArgumentError.value(
+        entityType,
+        'entityType',
+        'no adapter registered',
+      );
+    }
+    if (part != kEnvelopePart && adapter.encodePart == null) {
+      throw StateError(
+        'EntityAdapter.encodePart is required to write part '
+        '"$part"; without it the engine would mark a row it '
+        'cannot encode. The persist callback did not run.',
+      );
+    }
+    await _markChangedLocked(
+      entityType: entityType,
+      id: id,
+      adapter: adapter,
+      part: part,
+    );
+    return await runZoned(persist, zoneValues: {_writeZoneKey: true});
   }
 
   /// Writes a dirty metadata row for ([id], [part]). Caller already holds
   /// [_serialized].
   ///
-  /// Shared by [markChanged] and [write] so the two public marks cannot
+  /// Shared by [markChanged], [write], and [writeAll] so the public marks cannot
   /// drift. [adapter] is already resolved; this method does not look it up.
   /// [part] is the trimmed cell name; last-write-wins and the send queue
   /// both key this row, not a neighbour with the same [id].
@@ -527,7 +631,7 @@ final class UlsyncClient {
 
   /// Stops live ingest, then closes transport and store.
   ///
-  /// A second call is a no-op. Later [write], [markChanged], [selfCheck],
+  /// A second call is a no-op. Later [write], [writeAll], [markChanged], [selfCheck],
   /// [syncOnce], or [live] throw [StateError] with `UlsyncClient is closed`. Transport is
   /// closed before the store so a last ingest cannot persist into a closed
   /// database and look like a metadata bug.
@@ -593,9 +697,9 @@ final class UlsyncClient {
   /// [_tail] is a [Completer] completed in `whenComplete`, not the action's
   /// own future, so one error does not stall the queue.
   ///
-  /// The first line rejects re-entry from [write]'s persist callback. Nested
-  /// [UlsyncClient] calls would wait on this lock forever; a [StateError] is
-  /// louder than a hang in a sync library.
+  /// The first line rejects re-entry from a [write] or [writeAll] persist
+  /// callback. Nested [UlsyncClient] calls would wait on this lock forever;
+  /// a [StateError] is louder than a hang in a sync library.
   Future<T> _serialized<T>(Future<T> Function() action) {
     if (Zone.current[_writeZoneKey] == true) {
       throw StateError(
@@ -863,17 +967,39 @@ final class UlsyncClient {
     _appliedCursor = 0;
   }
 
-  /// Sends up to [kPushBatchLimit] dirty rows, one envelope per POST.
+  /// Sends up to [kPushBatchLimit] dirty rows in one [SyncTransport.push].
   ///
-  /// `full` still uses [EntityAdapter.load] and [EntityAdapter.encode].
-  /// Any other [EntityState.part] uses [EntityAdapter.encodePart]. A
-  /// `null` payload clears dirty without POST. The loop body still posts
-  /// one envelope; a later change batches that POST, not this queue.
+  /// Dirty marks of posted rows are not cleared before that call returns.
+  /// A thrown transport error (including HTTP 413) leaves every posted row
+  /// dirty so the next [syncOnce] retries the same related edit. Clearing a
+  /// prefix on the way in would drop half a [writeAll] after a dropped
+  /// connection — the hole this method exists to close.
+  ///
+  /// Rows with no adapter, or whose load / [EntityAdapter.encodePart]
+  /// returns `null`, are cleared without entering the POST — the same skip
+  /// as a single-row drain. They are not in [PushResult] lists and are not
+  /// rolled back if the POST later throws.
+  ///
+  /// [PushResult] length must match the request, and index *i* must name
+  /// envelope *i* (`id` and `part`). Otherwise this throws
+  /// [UlsyncProtocolException] and does not clear posted marks. After one
+  /// successful response, both `applied: true` and `applied: false` clear
+  /// dirty (SPEC section 7).
+  ///
+  /// HTTP 413 is [UlsyncRequestRejected] like any other 4xx. There is no
+  /// second send path that posts the same rows one envelope at a time: a
+  /// new client against a server whose limit is still 1 is a named
+  /// incompatibility, and two send paths would drift.
   Future<void> _pushDirty(_SyncCounters counters) async {
     final batch = await store.dirtyBatch(
       userScope: userScope,
       limit: kPushBatchLimit,
     );
+    if (batch.isEmpty) {
+      return;
+    }
+    final postedRows = <EntityState>[];
+    final envelopes = <Envelope>[];
     for (final row in batch) {
       _ensureOpen();
       final adapter = _adapters[row.entityType];
@@ -888,26 +1014,32 @@ final class UlsyncClient {
       }
       final createdAtMs = row.createdAtMs <= 0 ? 1 : row.createdAtMs;
       final lastEditedAtMs = row.lastEditedAtMs <= 0 ? 1 : row.lastEditedAtMs;
-      final envelope = Envelope(
-        id: row.id,
-        part: row.part,
-        entityType: row.entityType,
-        createdAtMs: createdAtMs,
-        lastEditedAtMs: lastEditedAtMs,
-        revision: row.revision,
-        sourceId: row.sourceId,
-        flags: kFlags,
-        schemaVersion: row.schemaVersion,
-        payloadEncoding: kPayloadEncoding,
-        payload: payload,
+      postedRows.add(row);
+      envelopes.add(
+        Envelope(
+          id: row.id,
+          part: row.part,
+          entityType: row.entityType,
+          createdAtMs: createdAtMs,
+          lastEditedAtMs: lastEditedAtMs,
+          revision: row.revision,
+          sourceId: row.sourceId,
+          flags: kFlags,
+          schemaVersion: row.schemaVersion,
+          payloadEncoding: kPayloadEncoding,
+          payload: payload,
+        ),
       );
-      // One envelope per request remains the round-1 server limit
-      // (max_envelopes_per_push: 1). Batching the POST is a later change.
-      final results = await _transport.push([envelope]);
-      final result = _pushResultFor(results, envelope.id);
-      await _clearDirty(row);
+    }
+    if (envelopes.isEmpty) {
+      return;
+    }
+    final results = await _transport.push(envelopes);
+    _requirePushResultsMatch(envelopes, results);
+    for (var i = 0; i < postedRows.length; i++) {
+      await _clearDirty(postedRows[i]);
       counters.pushed++;
-      if (result.applied) {
+      if (results[i].applied) {
         counters.accepted++;
       }
     }
@@ -1111,20 +1243,34 @@ final class UlsyncClient {
     );
   }
 
-  /// Picks the push row for [id], or the sole row when the list has one.
-  PushResult _pushResultFor(List<PushResult> results, String id) {
-    for (final row in results) {
-      if (row.id == id) {
-        return row;
+  /// Checks that [results] is in request order and names every envelope.
+  ///
+  /// SPEC section 3.1: `results[i]` is envelope `i`. Length mismatch or a
+  /// wrong `(id, part)` at an index is a protocol error; the caller must
+  /// not clear dirty. Matching by `id` alone would collapse two parts of
+  /// one record into one row.
+  void _requirePushResultsMatch(
+    List<Envelope> envelopes,
+    List<PushResult> results,
+  ) {
+    if (results.length != envelopes.length) {
+      throw UlsyncProtocolException(
+        'Push results length ${results.length} does not match '
+        'request length ${envelopes.length}',
+        field: 'results',
+      );
+    }
+    for (var i = 0; i < envelopes.length; i++) {
+      final envelope = envelopes[i];
+      final result = results[i];
+      if (result.id != envelope.id || result.part != envelope.part) {
+        throw UlsyncProtocolException(
+          'Push result $i is ${result.id}/${result.part}, '
+          'expected ${envelope.id}/${envelope.part}',
+          field: 'results',
+        );
       }
     }
-    if (results.length == 1) {
-      return results.single;
-    }
-    throw UlsyncProtocolException(
-      'Push response missing result for $id',
-      field: 'results',
-    );
   }
 
   /// Opens the live feed. Does not pull first: if the server is down, a pull
