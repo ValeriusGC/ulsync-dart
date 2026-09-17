@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-17 15:30:57 +0300  
-**Version:** 16  
+**Updated:** 2026-09-17 16:27:26 +0300  
+**Version:** 17  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `WriteOp` and `UlsyncClient.writeAll`: one related edit under the same
+  serial lock as `write`, so the live feed cannot POST the first rows
+  while the rest are still being persisted. Empty list is a no-op. There
+  is no transaction across the application store and the metadata file.
 - Named envelope parts besides `full`. `UlsyncClient.write` and
   `markChanged` take an optional `part` (default `full`). Optional
   `EntityAdapter.encodePart` / `applyPart` send and apply those slices
@@ -40,6 +44,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The dirty queue posts up to 500 envelopes in one `POST /v1/sync/push`
+  (`kPushBatchLimit` matches the SPEC maximum). Marks clear only after
+  that response, including `applied: false`. A thrown transport error
+  leaves posted marks set. HTTP 413 is not retried as single-envelope
+  POSTs.
 - Self-check of unknown local ids uses time `1` (not `0`): older than any
   real edit, and the server accepts it. Time `0` was rejected on push, so
   G4 never healed.

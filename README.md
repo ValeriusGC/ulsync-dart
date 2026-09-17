@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-17 15:30:57 +0300  
-**Version:** 14  
+**Updated:** 2026-09-17 16:27:26 +0300  
+**Version:** 15  
 **Document type:** readme
 
 ## What this is
@@ -40,11 +40,12 @@ Do not run `flutter pub add ulsync` — the package is not on pub.dev.
 
 ## Getting started
 
-The application talks to five types: `UlsyncClient`, `EntityAdapter`,
+The application talks to `UlsyncClient`, `EntityAdapter`, `WriteOp`,
 `SyncReport`, `SyncEvent`, and `SelfCheckReport`. Cursor, send queue,
 last-write-wins, retries of a dropped live socket, the self-check, and the
 wire format stay inside the library. Local edits go through
-`UlsyncClient.write` so a dirty mark cannot be forgotten; `markChanged`
+`UlsyncClient.write` so a dirty mark cannot be forgotten; `writeAll`
+covers one related action that touches many rows; `markChanged`
 remains as a low-level primitive (see **Recording a local edit** below).
 The first network call of each client is an origin handshake
 (see **Origin**); the library then runs a self-check once on the first
@@ -252,6 +253,37 @@ await client.write(
 );
 ```
 
+`write` is still the path for one row. A related edit that touches many
+rows — "move done to trash", hide a folder — uses `writeAll`. That is
+not a second queue and not a replacement for `write`. One entry into
+the serial lock covers every persist in the list, so the live feed
+cannot POST the first five while the rest are still being marked. An
+empty list is a no-op, not an error. There is still no transaction
+across the application store and the metadata file: if persist of
+item 5 throws, items 1–5 are marked dirty and 6…N have not started —
+the same contract as a throwing single `write`.
+
+```dart
+await client.writeAll([
+  for (final done in doneRows)
+    WriteOp(
+      entityType: 'task',
+      id: done.id,
+      part: 'deleted',
+      persist: () => db.writeDeleted(done.id, true),
+    ),
+]);
+```
+
+The send queue then posts up to 500 dirty rows in **one**
+`POST /v1/sync/push`. A hundred-row related edit therefore leaves in
+one request. Unrelated taps may still leave on later `syncOnce`
+passes when more than 500 rows are dirty; that is not a defect. An
+older server whose limit is still 1 answers HTTP 413 for a batch
+longer than one. The library does not retry that failure as
+single-envelope POSTs — a named cost of talking to a round-1 server,
+not a second send path.
+
 `markChanged` stays in the public API. It is a **low-level primitive**
 for applications that cannot persist through the library. Calling it
 *after* a local write can lose the record forever if the process dies,
@@ -305,9 +337,9 @@ metadata is stored so the same bytes are not replayed forever, and
 the application store is left untouched. That is how an older build
 ignores a slice it does not yet understand.
 
-This step still sends **one envelope per POST**. Batching the dirty
-queue is a later change. There is no tombstone type and no hide bit
-in `flags` (`flags` stay `0`).
+A drain of the dirty queue posts those envelopes in **one** POST
+(see **Recording a local edit**). There is no tombstone type and no
+hide bit in `flags` (`flags` stay `0`).
 
 ```dart
 await client.write(
@@ -374,7 +406,8 @@ What to call:
 |---|---|
 | Name the application contour | `origin:` on `UlsyncClient` — always. There is no setter. |
 | Handshake with the store | nothing — `GET /v1/sync/hello` runs before the first `syncOnce` exchange and before `live` opens |
-| Persist a local edit | `write` (preferred) or `markChanged` |
+| Persist a local edit | `write` (one row) or `writeAll` (one related action) |
+| Persist without the library callback | `markChanged` — low-level; prefer `write` |
 | Exchange with the server | `syncOnce` |
 | Find and repair divergence | nothing — `selfCheck` runs on the first `syncOnce`. Call it only for a manual diagnostic. |
 
@@ -398,9 +431,12 @@ in `SembastMetadataStore`.
 
 ## Limitations of round 1
 
-- One envelope per `POST /v1/sync/push`. The dirty queue is already a
-  list; a later change batches the **body** of the push loop, not the
-  queue. Named parts in this version still travel one POST each.
+- The send queue posts up to 500 envelopes in one `POST /v1/sync/push`
+  (the SPEC maximum, so a hundred-row related edit is one request). An
+  older server whose limit is still 1 answers HTTP 413 for a longer
+  batch. The library does not turn that into per-envelope POSTs.
+- Dirty marks for a posted batch are cleared only after that POST
+  returns. A thrown transport error leaves every posted mark set.
 - There is no tombstone type. Hiding a record is an application part
   the library does not interpret. `flags` stay `0`.
 - No payload compression, no clock-skew correction, no content schema
