@@ -1,7 +1,9 @@
 /// Contract between the sync engine and one application entity type.
 ///
 /// The metadata store holds revision, dirty, and cursor — not payload bytes.
-/// [load] and [apply] are the only path into the application's own database.
+/// [load] and [apply] are the path for part `full`. [encodePart] and
+/// [applyPart] are the path for every other name. The engine never copies
+/// payload into its own database.
 ///
 /// @docImport 'sync_engine.dart';
 library;
@@ -17,7 +19,8 @@ final class EntityAdapter<T> {
   ///
   /// [entityType] after trim must be non-empty. Duplicate types are rejected
   /// by the client, not here, because only the client sees the full list.
-  /// [listIds] is optional: existing adapters keep compiling without it.
+  /// [listIds], [encodePart], and [applyPart] are optional: existing adapters
+  /// keep compiling without them.
   EntityAdapter({
     required this.entityType,
     required this.schemaVersion,
@@ -26,6 +29,8 @@ final class EntityAdapter<T> {
     required this.load,
     required this.apply,
     this.listIds,
+    this.encodePart,
+    this.applyPart,
   }) {
     if (entityType.trim().isEmpty) {
       throw ArgumentError.value(entityType, 'entityType', 'must be non-empty');
@@ -54,13 +59,22 @@ final class EntityAdapter<T> {
 
   /// Reads the current application record, or `null` if it no longer exists.
   ///
-  /// Called at **push** time, not when [UlsyncClient.markChanged] runs. The
-  /// metadata store does not copy payload. If the record disappeared before
-  /// the send, this returns `null` and the engine clears `dirty` without
-  /// contacting the server. That is not an error.
+  /// Called at **push** time for part [kEnvelopePart], not when
+  /// [UlsyncClient.markChanged] runs. Named parts use [encodePart] instead.
+  /// The metadata store does not copy payload. If the record disappeared
+  /// before the send, this returns `null` and the engine clears `dirty`
+  /// without contacting the server. That is not an error.
   final Future<T?> Function(String id) load;
 
-  /// Writes [value] into the application store.
+  /// Writes a **full snapshot** [value] into the application store.
+  ///
+  /// Runs only for incoming [kEnvelopePart]. Named slices use [applyPart].
+  /// This callback **must not** write fields that travel as their own parts
+  /// (checkbox, hide flag, and so on). Last-write-wins already keeps those
+  /// cells independent on the wire; writing them from `full` makes a newer
+  /// snapshot restore a hidden row or clear a checkbox the library cannot
+  /// see. The library does not inspect which columns you touch — the
+  /// adapter is the contract.
   ///
   /// **Must be idempotent.** The application database and the library
   /// metadata database are different files; no transaction covers both. The
@@ -83,8 +97,34 @@ final class EntityAdapter<T> {
   ///
   /// Optional. When absent, the library cannot compare its metadata with the
   /// application's data, and reconciliation reports itself unavailable instead
-  /// of failing. Ids only: the library never asks for payload here.
+  /// of failing. Ids only: the library never asks for payload here. Include
+  /// hidden rows: an id missing from this list looks like a deletion to the
+  /// library, not a hide.
   final Future<List<String>> Function()? listIds;
+
+  /// Optional encoder for a named envelope part other than [kEnvelopePart].
+  ///
+  /// The engine never invents part names. Hide is an application slice, not
+  /// a letter type the library understands. There is no tombstone type.
+  /// When [UlsyncClient.write] is called with `part` not equal to `full`,
+  /// this callback **must** be set; otherwise the engine throws [StateError]
+  /// **before** marking dirty so a missing encoder cannot leave an
+  /// unsendable row.
+  ///
+  /// Returning `null` means there is nothing to send: dirty is cleared without
+  /// POST — the same contract as [load] returning `null`.
+  final Future<Uint8List?> Function(String id, String part)? encodePart;
+
+  /// Optional applier for a named envelope part other than [kEnvelopePart].
+  ///
+  /// Incoming `full` still uses [decode] and [apply]. This callback is the
+  /// only path into the application store for any other part name. The engine
+  /// never invents part names. A foreign name when this callback is omitted
+  /// does **not** fail the exchange: the cursor still advances, the part's
+  /// metadata is stored so the envelope is not replayed forever, and the
+  /// domain is left untouched. There is no tombstone type.
+  final Future<void> Function(String id, String part, Uint8List payload)?
+  applyPart;
 
   /// Encodes [value] after a cast to [T].
   ///

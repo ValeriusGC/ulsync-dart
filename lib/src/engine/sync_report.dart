@@ -38,7 +38,9 @@ final class SyncReport {
   /// wins or an unknown type. Live-feed envelopes are not counted.
   final int pulled;
 
-  /// Times [EntityAdapter.apply] ran during this pass, not including live.
+  /// Times a domain apply ran during this pass ([EntityAdapter.apply] for
+  /// `full`, [EntityAdapter.applyPart] for other parts), not including live.
+  /// An unknown part with no `applyPart` does not increment this.
   final int applied;
 
   /// Applied cursor after this pass (`server_seq` of the last persisted

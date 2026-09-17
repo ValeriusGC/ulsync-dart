@@ -33,7 +33,9 @@ final class EntityState {
   /// Stable entity identifier (wire field `id`).
   final String id;
 
-  /// Envelope part name (round 1 always `full`).
+  /// Envelope part name. Opaque key string, not a letter type. `full` is
+  /// the complete snapshot; any other non-empty value is an application
+  /// slice. Last-write-wins compares inside `(id, part)` only.
   final String part;
 
   /// Creation time as Unix epoch milliseconds (wire `created_at_ms`).
