@@ -1,24 +1,22 @@
-/// Two-window tap counter demo for the ulsync client library.
+/// Self-hosted to-do list demo for the ulsync client library.
 ///
-/// Connect once per process with a distinct Device ID so each macOS window
-/// keeps its own metadata file. Token and base URL defaults come from
-/// `--dart-define`; the Connect form can override them before opening
-/// [UlsyncClient].
+/// Pair once per process with a distinct device name so each macOS window keeps
+/// its own metadata file. Server address and access key may be prefilled from
+/// `--dart-define`; pairing still walks health and whoami before [UlsyncClient]
+/// opens.
 library;
 
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:ulsync/ulsync.dart';
-import 'package:ulsync_example/tap.dart';
+import 'package:ulsync_example/server_probe.dart';
+import 'package:ulsync_example/session_status.dart';
+import 'package:ulsync_example/todo.dart';
 
 /// Default origin when `--dart-define=ULSYNC_BASE_URL` is omitted (macOS host).
-///
-/// Android emulator must pass `http://10.0.2.2:8080` via `--dart-define`; see
-/// `example/README.md`.
 const String kDefaultBaseUrl = 'http://127.0.0.1:8080';
 
 /// Application-contour origin (SPEC section 1.5). Same string on every
@@ -27,182 +25,249 @@ const String kUlsyncOrigin =
     'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f';
 
 void main() {
-  runApp(const UlsyncExampleApp());
+  runApp(const TodosApp());
 }
 
-/// Root widget.
-final class UlsyncExampleApp extends StatelessWidget {
-  /// Creates the example app.
-  const UlsyncExampleApp({super.key});
+/// Root widget for the round-2 living client sample.
+final class TodosApp extends StatelessWidget {
+  /// Creates the example application.
+  const TodosApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ulsync example',
-      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-      home: const ExampleHomePage(),
+      title: 'Todos',
+      theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+      home: const TodosRootPage(),
     );
   }
 }
 
-/// Connect form and, after a successful handshake, the tap counter screen.
-final class ExampleHomePage extends StatefulWidget {
-  /// Creates the home page.
-  const ExampleHomePage({super.key});
+/// Pairing gate and, after sign-in, the synchronized to-do screens.
+final class TodosRootPage extends StatefulWidget {
+  /// Creates the root page.
+  const TodosRootPage({super.key});
 
   @override
-  State<ExampleHomePage> createState() => _ExampleHomePageState();
+  State<TodosRootPage> createState() => _TodosRootPageState();
 }
 
-final class _ExampleHomePageState extends State<ExampleHomePage> {
-  /// Compile-time default for the Base URL field.
-  static const _defaultBaseUrl = String.fromEnvironment(
+enum _PairingStep { serverAddress, signIn, signedIn }
+
+final class _TodosRootPageState extends State<TodosRootPage> {
+  static const _defaultServer = String.fromEnvironment(
     'ULSYNC_BASE_URL',
     defaultValue: kDefaultBaseUrl,
   );
 
-  /// Compile-time default for the Token field (may be empty).
-  static const _defaultToken = String.fromEnvironment('ULSYNC_TOKEN');
+  static const _defaultAccessKey = String.fromEnvironment('ULSYNC_TOKEN');
 
-  /// Compile-time default for the User field.
-  static const _defaultUser = String.fromEnvironment(
-    'ULSYNC_USER',
-    defaultValue: 'alice',
-  );
-
-  /// Compile-time default for the Device ID field.
-  static const _defaultDeviceId = String.fromEnvironment(
+  static const _defaultDeviceName = String.fromEnvironment(
     'ULSYNC_SOURCE_ID',
-    defaultValue: 'example-device',
+    defaultValue: 'phone',
   );
 
-  final _baseUrlController = TextEditingController(text: _defaultBaseUrl);
-  final _tokenController = TextEditingController(text: _defaultToken);
-  final _userController = TextEditingController(text: _defaultUser);
-  final _deviceIdController = TextEditingController(text: _defaultDeviceId);
+  final _serverController = TextEditingController(text: _defaultServer);
+  final _accessKeyController = TextEditingController(text: _defaultAccessKey);
+  final _deviceNameController = TextEditingController(text: _defaultDeviceName);
+  final _newTodoController = TextEditingController();
 
-  /// Local journal; entity payloads are not stored in sembast.
-  final TapLog _tapLog = TapLog();
+  final TodoJournal _journal = TodoJournal();
 
-  /// Monotonic tap sequence within this window (part of wire ids).
-  int _tapSequence = 0;
-
-  /// Human-readable event lines, newest first.
-  final List<String> _events = [];
+  _PairingStep _pairingStep = _PairingStep.serverAddress;
+  Uri? _baseUrl;
+  String _displayHost = '';
+  String _accessKey = '';
+  String _userId = '';
+  String _deviceName = '';
+  String _databasePath = '';
 
   UlsyncClient? _client;
   StreamSubscription<SyncEvent>? _liveSub;
 
-  /// Bearer token captured at Connect; survives disposal of the form fields.
-  String _connectedToken = '';
-
-  /// Whether the live feed subscription is active.
-  bool _liveActive = false;
-
-  /// Per-window network mute; does not call [UlsyncClient.close].
-  bool _offline = false;
-
-  bool _connecting = false;
+  SessionStatus _sessionStatus = SessionStatus.connecting;
+  bool _workOffline = false;
+  bool _connectionLost = false;
   bool _busy = false;
   String? _formError;
+  bool _showTrash = false;
 
-  /// `true` after Connect succeeds; shows the counter instead of the form.
-  bool _connected = false;
+  int _todoSequence = 0;
 
   @override
   void dispose() {
     unawaited(_liveSub?.cancel());
     unawaited(_client?.close());
-    _baseUrlController.dispose();
-    _tokenController.dispose();
-    _userController.dispose();
-    _deviceIdController.dispose();
+    _serverController.dispose();
+    _accessKeyController.dispose();
+    _deviceNameController.dispose();
+    _newTodoController.dispose();
     super.dispose();
   }
 
-  /// Returns `true` when the Token field has non-whitespace text.
-  bool get _tokenPresent => _tokenController.text.trim().isNotEmpty;
-
-  /// Appends one line to the on-screen journal, capped at 20 entries.
-  void _log(String line) {
-    if (!mounted) {
-      return;
+  void _onJournalChanged() {
+    if (mounted) {
+      setState(() {});
     }
-    setState(() {
-      _events.insert(0, line);
-      if (_events.length > 20) {
-        _events.removeLast();
-      }
-    });
   }
 
-  /// Opens the metadata store, client, and live feed using form values.
-  Future<void> _connect() async {
-    if (_connecting || !_tokenPresent) {
+  SessionStatus _deriveSessionStatus() {
+    if (_workOffline) {
+      return SessionStatus.offline;
+    }
+    if (_connectionLost) {
+      return SessionStatus.reconnecting;
+    }
+    if (_sessionStatus == SessionStatus.unreachable) {
+      return SessionStatus.unreachable;
+    }
+    if (_sessionStatus == SessionStatus.live) {
+      return SessionStatus.live;
+    }
+    return SessionStatus.connecting;
+  }
+
+  Future<void> _continueFromServer() async {
+    final text = _serverController.text.trim();
+    if (text.isEmpty) {
       return;
     }
     setState(() {
-      _connecting = true;
+      _busy = true;
       _formError = null;
     });
+    try {
+      final base = Uri.parse(text);
+      await pingHealth(base);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _baseUrl = base;
+        _displayHost = displayHost(base);
+        _pairingStep = _PairingStep.signIn;
+        _busy = false;
+      });
+    } on HealthCheckException catch (e) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _formError = e.message;
+        _busy = false;
+      });
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _formError = const HealthCheckException(
+          "Can't reach this server. Check the address and that the server is running.",
+        ).message;
+        _busy = false;
+      });
+    }
+  }
 
-    final user = _userController.text.trim();
-    final deviceRaw = _deviceIdController.text;
-    final safeDevice = safeDeviceId(deviceRaw);
+  Future<UlsyncClient> _createClient() async {
+    final base = _baseUrl;
+    if (base == null || _databasePath.isEmpty) {
+      throw StateError('pairing context missing');
+    }
+    final store = await SembastMetadataStore.open(databasePath: _databasePath);
+    return UlsyncClient(
+      baseUrl: base,
+      origin: kUlsyncOrigin,
+      userScope: _userId,
+      sourceId: _deviceName,
+      tokenProvider: () async => _accessKey,
+      store: store,
+      adapters: [
+        buildTodoAdapter(journal: _journal, onChanged: _onJournalChanged),
+      ],
+    );
+  }
+
+  /// Replaces [UlsyncClient] so Work offline can mute the feed without
+  /// dropping the local journal or the dirty queue.
+  ///
+  /// [UlsyncClient.live] starts a background ingest that runs until
+  /// [UlsyncClient.close]. Cancelling the app's [StreamSubscription] does
+  /// not stop that loop (round-1 live trap): remote trash would still land
+  /// in the journal while the strip said Offline, and I5 would be untestable.
+  /// There is no `pauseLive` on the engine in this step.
+  ///
+  /// Close + reopen of the **same** metadata file is the mute that still
+  /// allows [UlsyncClient.write] / [UlsyncClient.writeAll] (I6, I8). The
+  /// in-memory [TodoJournal] is not cleared. [syncOnce] must **not** run
+  /// on the offline instance: that would pull the remote trash we just
+  /// muted. Catch-up is only [startLive], which pushes dirty first, then
+  /// pulls (I5: local `done` and remote `deleted` meet after Online).
+  ///
+  /// If [syncOnce] fails after close, this keeps the new client **without**
+  /// live so later writes do not hit `UlsyncClient is closed`.
+  Future<void> _replaceClient({required bool startLive}) async {
+    await _liveSub?.cancel();
+    _liveSub = null;
+    final previous = _client;
+    _client = null;
+    await previous?.close();
+
+    final next = await _createClient();
+    _client = next;
+    if (!startLive) {
+      return;
+    }
+    try {
+      await next.syncOnce();
+      _liveSub = next.live().listen(_onLiveEvent, onError: _onLiveError);
+    } catch (_) {
+      await _liveSub?.cancel();
+      _liveSub = null;
+      rethrow;
+    }
+  }
+
+  Future<void> _signIn() async {
+    final base = _baseUrl;
+    if (base == null || _busy) {
+      return;
+    }
+    final key = _accessKeyController.text.trim();
+    if (key.isEmpty) {
+      return;
+    }
+    final safeDevice = safeDeviceId(_deviceNameController.text);
     if (safeDevice == null) {
       setState(() {
-        _connecting = false;
         _formError =
-            'Device ID must use letters, digits, dot, underscore, hyphen '
+            'Device name must use letters, digits, dot, underscore, hyphen '
             'only (no spaces or path segments).';
       });
       return;
     }
 
-    final baseUrlText = _baseUrlController.text.trim();
-    final token = _tokenController.text.trim();
-    _connectedToken = token;
-    _tapLog.clear();
-    _tapSequence = 0;
+    setState(() {
+      _busy = true;
+      _formError = null;
+    });
 
     UlsyncClient? client;
     try {
+      final who = await fetchWhoAmI(baseUrl: base, accessKey: key);
       final databasePath = kIsWeb
           ? 'ulsync_example_$safeDevice.db'
           : '${(await getApplicationDocumentsDirectory()).path}/'
                 'ulsync_example_$safeDevice.db';
-      final store = await SembastMetadataStore.open(databasePath: databasePath);
-      client = UlsyncClient(
-        baseUrl: Uri.parse(baseUrlText),
-        origin: kUlsyncOrigin,
-        userScope: user,
-        sourceId: safeDevice,
-        tokenProvider: () async =>
-            _connectedToken.isEmpty ? null : _connectedToken,
-        store: store,
-        adapters: [
-          EntityAdapter<Tap>(
-            entityType: 'counter_operation',
-            schemaVersion: 1,
-            encode: (tap) => Uint8List.fromList(
-              utf8.encode(jsonEncode({'id': tap.id, 'delta': tap.delta})),
-            ),
-            decode: (bytes, schemaVersion) {
-              final decoded = jsonDecode(utf8.decode(bytes));
-              final map = Map<String, Object?>.from(decoded as Map);
-              return Tap(id: map['id']! as String, delta: map['delta']! as int);
-            },
-            load: (id) async => _tapLog.byId(id),
-            apply: (tap) async {
-              final inserted = _tapLog.apply(tap);
-              if (inserted && mounted) {
-                setState(() {});
-              }
-            },
-          ),
-        ],
-      );
-      final report = await client.syncOnce();
+      _databasePath = databasePath;
+      _accessKey = key;
+      _deviceName = safeDevice;
+      _userId = who.userId;
+      _journal.clear();
+      _todoSequence = 0;
+
+      client = await _createClient();
+      await client.syncOnce();
       _liveSub = client.live().listen(_onLiveEvent, onError: _onLiveError);
       if (!mounted) {
         await client.close();
@@ -210,26 +275,30 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
       }
       setState(() {
         _client = client;
-        _connected = true;
-        _offline = false;
-        _liveActive = true;
-        _connecting = false;
-        _events.clear();
+        _pairingStep = _PairingStep.signedIn;
+        _sessionStatus = SessionStatus.connecting;
+        _workOffline = false;
+        _connectionLost = false;
+        _showTrash = false;
+        _busy = false;
       });
-      _log('connected');
-      _log(
-        'pushed ${report.pushed}  accepted ${report.accepted}  '
-        'applied ${report.applied}  cursor ${report.cursor}',
-      );
+    } on SignInException catch (e) {
+      await client?.close();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _formError = e.message;
+        _busy = false;
+      });
     } catch (e) {
       await client?.close();
       if (!mounted) {
         return;
       }
       setState(() {
-        _connecting = false;
         _formError = '$e';
-        _connectedToken = '';
+        _busy = false;
       });
     }
   }
@@ -238,34 +307,39 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
     if (!mounted) {
       return;
     }
-    _log(_describe(event));
+    switch (event) {
+      case SyncConnectionLost():
+        setState(() {
+          _connectionLost = true;
+          if (!_workOffline) {
+            _sessionStatus = SessionStatus.reconnecting;
+          }
+        });
+      case SyncConnectionRestored():
+        setState(() {
+          _connectionLost = false;
+          if (!_workOffline) {
+            _sessionStatus = SessionStatus.live;
+          }
+        });
+      case SyncApplied():
+      case SyncCursorAdvanced():
+      case SyncUnknownType():
+        break;
+    }
   }
 
   void _onLiveError(Object error) {
-    if (!mounted) {
+    if (!mounted || _workOffline) {
       return;
     }
     setState(() {
+      _sessionStatus = SessionStatus.unreachable;
       _formError = '$error';
     });
-    _log('live error: $error');
   }
 
-  /// Human-readable line for the on-screen event log.
-  String _describe(SyncEvent event) {
-    return switch (event) {
-      SyncApplied(:final entities) =>
-        'applied ${entities.map((e) => '${e.entityType}/${e.id}').join(', ')}',
-      SyncCursorAdvanced(:final cursor) => 'cursor $cursor',
-      SyncConnectionLost() => 'connection lost',
-      SyncConnectionRestored() => 'connection restored',
-      SyncUnknownType(:final entityType, :final id) =>
-        'unknown type $entityType/$id',
-    };
-  }
-
-  /// Cancels live, closes the client, and returns to the Connect form.
-  Future<void> _disconnect() async {
+  Future<void> _signOut() async {
     await _liveSub?.cancel();
     _liveSub = null;
     await _client?.close();
@@ -274,55 +348,56 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
     }
     setState(() {
       _client = null;
-      _connected = false;
-      _connectedToken = '';
-      _liveActive = false;
-      _offline = false;
-      _tapLog.clear();
-      _tapSequence = 0;
+      _pairingStep = _PairingStep.serverAddress;
+      _journal.clear();
+      _showTrash = false;
+      _workOffline = false;
+      _connectionLost = false;
+      _sessionStatus = SessionStatus.connecting;
+      _formError = null;
     });
   }
 
-  /// Builds the next wire id: device id, UTC micros, and a per-window sequence.
-  String _nextTapId(String deviceId) {
-    _tapSequence += 1;
-    final micros = DateTime.now().toUtc().microsecondsSinceEpoch;
-    return '$deviceId-$micros-$_tapSequence';
-  }
-
-  /// Records one plus locally, marks dirty, and syncs when online.
-  Future<void> _increment() async {
-    final client = _client;
-    if (client == null || _busy) {
+  Future<void> _setWorkOffline(bool offline) async {
+    if (_client == null || _workOffline == offline || _busy) {
       return;
     }
     setState(() {
       _busy = true;
+      _formError = null;
     });
     try {
-      final deviceId = safeDeviceId(_deviceIdController.text)!;
-      final tap = Tap(id: _nextTapId(deviceId), delta: 1);
-      _tapLog.apply(tap);
-      if (mounted) {
-        setState(() {});
-      }
-      await client.markChanged(entityType: 'counter_operation', id: tap.id);
-      if (_offline) {
-        _log('queued locally (offline)');
-      } else {
-        final report = await client.syncOnce();
-        _log(
-          'pushed ${report.pushed}  applied ${report.applied}  '
-          'cursor ${report.cursor}',
-        );
-      }
-    } catch (e) {
-      if (mounted) {
+      if (offline) {
+        await _replaceClient(startLive: false);
+        if (!mounted) {
+          return;
+        }
         setState(() {
-          _formError = '$e';
+          _workOffline = true;
+          _connectionLost = false;
         });
+        return;
       }
-      _log('sync error: $e');
+
+      await _replaceClient(startLive: true);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _workOffline = false;
+        _connectionLost = false;
+        _sessionStatus = SessionStatus.live;
+      });
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _formError = '$e';
+        if (!offline) {
+          _sessionStatus = SessionStatus.unreachable;
+        }
+      });
     } finally {
       if (mounted) {
         setState(() {
@@ -332,136 +407,239 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
     }
   }
 
-  /// Toggles the per-window Offline switch without closing the client.
-  Future<void> _setOffline(bool value) async {
-    final client = _client;
-    if (client == null || _offline == value) {
-      return;
-    }
-    if (value) {
-      await _liveSub?.cancel();
-      _liveSub = null;
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _offline = true;
-        _liveActive = false;
-      });
-      _log('offline enabled');
-      return;
-    }
+  String _nextTodoId() {
+    _todoSequence += 1;
+    final micros = DateTime.now().toUtc().microsecondsSinceEpoch;
+    return '$_deviceName-$micros-$_todoSequence';
+  }
 
+  Future<void> _addTodo() async {
+    final client = _client;
+    if (client == null || _busy) {
+      return;
+    }
+    final title = _newTodoController.text.trim();
+    if (title.isEmpty) {
+      return;
+    }
+    final id = _nextTodoId();
     setState(() {
-      _offline = false;
+      _busy = true;
     });
     try {
-      final report = await client.syncOnce();
-      _log(
-        'pushed ${report.pushed}  applied ${report.applied}  '
-        'cursor ${report.cursor}',
+      await client.write(
+        entityType: kTodoEntityType,
+        id: id,
+        persist: () async {
+          _journal.setTitle(id, title);
+          _onJournalChanged();
+        },
       );
-      _liveSub = client.live().listen(_onLiveEvent, onError: _onLiveError);
-      if (!mounted) {
-        return;
+      _newTodoController.clear();
+      if (!_workOffline) {
+        await client.syncOnce();
       }
-      setState(() {
-        _liveActive = true;
-      });
-      _log('online restored');
     } catch (e) {
       if (mounted) {
         setState(() {
           _formError = '$e';
+          if (!_workOffline) {
+            _sessionStatus = SessionStatus.unreachable;
+          }
         });
       }
-      _log('sync error: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
     }
   }
 
-  Future<void> _handleDisconnect() async {
-    await _disconnect();
-    if (!mounted) {
+  Future<void> _setDone(String id, bool done) async {
+    final client = _client;
+    if (client == null || _busy) {
       return;
     }
     setState(() {
-      _events.clear();
-      _formError = null;
+      _busy = true;
     });
+    try {
+      await client.write(
+        entityType: kTodoEntityType,
+        id: id,
+        part: kTodoPartDone,
+        persist: () async {
+          _journal.setDone(id, done);
+          _onJournalChanged();
+        },
+      );
+      if (!_workOffline) {
+        await client.syncOnce();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _formError = '$e';
+          if (!_workOffline) {
+            _sessionStatus = SessionStatus.unreachable;
+          }
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _setDeleted(String id, bool deleted) async {
+    final client = _client;
+    if (client == null || _busy) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+    });
+    try {
+      await client.write(
+        entityType: kTodoEntityType,
+        id: id,
+        part: kTodoPartDeleted,
+        persist: () async {
+          _journal.setDeleted(id, deleted);
+          _onJournalChanged();
+        },
+      );
+      if (!_workOffline) {
+        await client.syncOnce();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _formError = '$e';
+          if (!_workOffline) {
+            _sessionStatus = SessionStatus.unreachable;
+          }
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  /// Sends one [writeAll] batch of trash parts for every done, visible row.
+  ///
+  /// A loop of [UlsyncClient.write] would let live sync POST the first rows
+  /// while the rest are still dirty; the library batch API exists for this
+  /// product action (round-2 I6).
+  Future<void> _moveDoneToTrash() async {
+    final client = _client;
+    if (client == null || _busy) {
+      return;
+    }
+    final ids = _journal.doneNotTrashedIds();
+    if (ids.isEmpty) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+    });
+    try {
+      await client.writeAll([
+        for (final id in ids)
+          WriteOp(
+            entityType: kTodoEntityType,
+            id: id,
+            part: kTodoPartDeleted,
+            persist: () async {
+              _journal.setDeleted(id, true);
+              _onJournalChanged();
+            },
+          ),
+      ]);
+      if (!_workOffline) {
+        await client.syncOnce();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _formError = '$e';
+          if (!_workOffline) {
+            _sessionStatus = SessionStatus.unreachable;
+          }
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_connected) {
-      return _buildCounterScreen(context);
-    }
-    return _buildConnectScreen(context);
+    return switch (_pairingStep) {
+      _PairingStep.serverAddress => _buildServerScreen(context),
+      _PairingStep.signIn => _buildSignInScreen(context),
+      _PairingStep.signedIn =>
+        _showTrash ? _buildTrashScreen(context) : _buildTodoScreen(context),
+    };
   }
 
-  Widget _buildConnectScreen(BuildContext context) {
-    final tokenMissing = !_tokenPresent;
+  Widget _buildServerScreen(BuildContext context) {
+    final canContinue = _serverController.text.trim().isNotEmpty && !_busy;
     return Scaffold(
-      appBar: AppBar(title: const Text('ulsync example')),
+      appBar: AppBar(title: const Text('Todos')),
       body: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(24),
         child: ListView(
           children: [
-            TextField(
-              controller: _baseUrlController,
-              decoration: const InputDecoration(
-                labelText: 'Base URL',
-                helperText:
-                    'Android emulator uses http://10.0.2.2:8080 '
-                    '(pass --dart-define=ULSYNC_BASE_URL=…)',
-                border: OutlineInputBorder(),
-              ),
-              autocorrect: false,
+            Text(
+              'Your list stays on the server you choose.',
+              style: Theme.of(context).textTheme.titleMedium,
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 24),
             TextField(
-              controller: _tokenController,
+              controller: _serverController,
               decoration: const InputDecoration(
-                labelText: 'Token',
+                labelText: 'Server address',
+                hintText: 'https://sync.example.com',
+                helperText:
+                    'Include the port when it is not 443. '
+                    'Example: http://127.0.0.1:8080',
                 border: OutlineInputBorder(),
               ),
+              keyboardType: TextInputType.url,
+              textInputAction: TextInputAction.go,
               autocorrect: false,
+              onSubmitted: (_) {
+                if (canContinue) {
+                  unawaited(_continueFromServer());
+                }
+              },
               onChanged: (_) => setState(() {}),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _userController,
-              decoration: const InputDecoration(
-                labelText: 'User',
-                border: OutlineInputBorder(),
-              ),
-              autocorrect: false,
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _deviceIdController,
-              decoration: const InputDecoration(
-                labelText: 'Device ID',
-                border: OutlineInputBorder(),
-              ),
-              autocorrect: false,
-            ),
-            const SizedBox(height: 12),
-            if (tokenMissing)
-              const Text(
-                'pass a bearer token (local mint: subject alice)',
-                style: TextStyle(
-                  color: Colors.red,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
             if (_formError != null) ...[
-              const SizedBox(height: 12),
-              Text(_formError!, style: const TextStyle(color: Colors.red)),
+              const SizedBox(height: 16),
+              Text(
+                _formError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
             ],
-            const SizedBox(height: 16),
+            const SizedBox(height: 24),
             FilledButton(
-              onPressed: _connecting || tokenMissing ? null : _connect,
-              child: Text(_connecting ? 'Connecting…' : 'Connect'),
+              onPressed: canContinue ? _continueFromServer : null,
+              child: Text(_busy ? 'Checking…' : 'Continue'),
             ),
           ],
         ),
@@ -469,55 +647,324 @@ final class _ExampleHomePageState extends State<ExampleHomePage> {
     );
   }
 
-  Widget _buildCounterScreen(BuildContext context) {
-    final user = _userController.text.trim();
-    final device = safeDeviceId(_deviceIdController.text) ?? '';
-    final liveLabel = _liveActive ? 'on' : 'off';
-    final offlineLabel = _offline ? 'yes' : 'no';
-
+  Widget _buildSignInScreen(BuildContext context) {
+    final keyPresent = _accessKeyController.text.trim().isNotEmpty;
+    final canSignIn = keyPresent && !_busy;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('ulsync example'),
-        actions: [
-          TextButton(
-            onPressed: _handleDisconnect,
-            child: const Text('Disconnect'),
-          ),
-        ],
+        title: const Text('Sign in'),
+        leading: BackButton(
+          onPressed: _busy
+              ? null
+              : () {
+                  setState(() {
+                    _pairingStep = _PairingStep.serverAddress;
+                    _formError = null;
+                  });
+                },
+        ),
       ),
       body: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(24),
         child: ListView(
           children: [
             Text(
-              '${_tapLog.value}',
-              style: Theme.of(context).textTheme.displayLarge,
-              textAlign: TextAlign.center,
+              'Signing in to $_displayHost',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 24),
+            TextField(
+              controller: _accessKeyController,
+              decoration: const InputDecoration(
+                labelText: 'Access key',
+                helperText:
+                    'Paste the key from your identity provider. '
+                    'This app does not create keys.',
+                border: OutlineInputBorder(),
+              ),
+              obscureText: true,
+              enableSuggestions: false,
+              autocorrect: false,
+              onChanged: (_) => setState(() {}),
             ),
             const SizedBox(height: 16),
-            FilledButton(
-              onPressed: _busy ? null : _increment,
-              child: const Text('+'),
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                const Text('Offline'),
-                Switch(value: _offline, onChanged: _setOffline),
-              ],
-            ),
-            Text(
-              'user=$user  device=$device  live=$liveLabel  offline=$offlineLabel',
+            TextField(
+              controller: _deviceNameController,
+              decoration: const InputDecoration(
+                labelText: 'Device name',
+                helperText: 'This installation. Open a second window with a different name.',
+                border: OutlineInputBorder(),
+              ),
+              autocorrect: false,
             ),
             if (_formError != null) ...[
-              const SizedBox(height: 12),
-              Text(_formError!, style: const TextStyle(color: Colors.red)),
+              const SizedBox(height: 16),
+              Text(
+                _formError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
             ],
-            const SizedBox(height: 16),
-            Text('Events', style: Theme.of(context).textTheme.titleMedium),
-            for (final line in _events) Text('• $line'),
+            const SizedBox(height: 24),
+            FilledButton(
+              onPressed: canSignIn ? _signIn : null,
+              child: Text(_busy ? 'Signing in…' : 'Sign in'),
+            ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _sessionBanner(BuildContext context) {
+    final status = _deriveSessionStatus();
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHighest,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Row(
+          children: [
+            Semantics(
+              label: status.bannerLine(host: _displayHost),
+              child: Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: status.indicatorColor(scheme),
+                  shape: BoxShape.circle,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                status.bannerLine(host: _displayHost),
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _signedInAppBarActions(BuildContext context) {
+    return [
+      IconButton(
+        tooltip: 'Work offline',
+        onPressed: _busy
+            ? null
+            : () => unawaited(_setWorkOffline(!_workOffline)),
+        icon: Icon(_workOffline ? Icons.cloud_off : Icons.cloud_outlined),
+      ),
+      PopupMenuButton<_AccountAction>(
+        onSelected: (action) {
+          switch (action) {
+            case _AccountAction.signOut:
+              unawaited(_signOut());
+          }
+        },
+        itemBuilder: (context) => [
+          PopupMenuItem<_AccountAction>(
+            enabled: false,
+            child: Text('Signed in as $_userId'),
+          ),
+          PopupMenuItem<_AccountAction>(
+            enabled: false,
+            child: Text(_displayHost),
+          ),
+          const PopupMenuDivider(),
+          const PopupMenuItem<_AccountAction>(
+            value: _AccountAction.signOut,
+            child: Text('Sign out'),
+          ),
+        ],
+      ),
+    ];
+  }
+
+  Widget _buildTodoScreen(BuildContext context) {
+    final todos = _journal.activeTodos();
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Todos'),
+        actions: _signedInAppBarActions(context),
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _sessionBanner(context),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _newTodoController,
+                    decoration: const InputDecoration(
+                      labelText: 'New to-do',
+                      border: OutlineInputBorder(),
+                    ),
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => unawaited(_addTodo()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _busy ? null : () => unawaited(_addTodo()),
+                  child: const Text('Add'),
+                ),
+              ],
+            ),
+          ),
+          if (_formError != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(
+                _formError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: _busy || _journal.doneNotTrashedIds().isEmpty
+                  ? null
+                  : () => unawaited(_moveDoneToTrash()),
+              icon: const Icon(Icons.delete_sweep_outlined),
+              label: const Text('Move done to trash'),
+            ),
+          ),
+          Expanded(
+            child: todos.isEmpty
+                ? Center(
+                    child: Text(
+                      'No to-dos yet',
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    itemCount: todos.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final todo = todos[index];
+                      return _TodoRow(
+                        todo: todo,
+                        busy: _busy,
+                        onDoneChanged: (v) => unawaited(_setDone(todo.id, v)),
+                        onTrash: () => unawaited(_setDeleted(todo.id, true)),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => setState(() => _showTrash = true),
+        icon: const Icon(Icons.delete_outline),
+        label: Text('Trash (${_journal.trashedTodos().length})'),
+      ),
+    );
+  }
+
+  Widget _buildTrashScreen(BuildContext context) {
+    final trashed = _journal.trashedTodos();
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Trash'),
+        leading: BackButton(
+          onPressed: () => setState(() => _showTrash = false),
+        ),
+        actions: _signedInAppBarActions(context),
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _sessionBanner(context),
+          Expanded(
+            child: trashed.isEmpty
+                ? Center(
+                    child: Text(
+                      'Trash is empty',
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.all(8),
+                    itemCount: trashed.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final todo = trashed[index];
+                      return ListTile(
+                        title: Text(
+                          todo.title.isEmpty ? '(untitled)' : todo.title,
+                          style: todo.done
+                              ? const TextStyle(
+                                  decoration: TextDecoration.lineThrough,
+                                )
+                              : null,
+                        ),
+                        subtitle: Text(
+                          formatEditedAtLocal(todo.lastEditedAtMs),
+                        ),
+                        trailing: TextButton(
+                          onPressed: _busy
+                              ? null
+                              : () => unawaited(_setDeleted(todo.id, false)),
+                          child: const Text('Restore'),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+enum _AccountAction { signOut }
+
+/// One active list row with done checkbox, edited time, and trash action.
+final class _TodoRow extends StatelessWidget {
+  const _TodoRow({
+    required this.todo,
+    required this.busy,
+    required this.onDoneChanged,
+    required this.onTrash,
+  });
+
+  final Todo todo;
+  final bool busy;
+  final ValueChanged<bool> onDoneChanged;
+  final VoidCallback onTrash;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Checkbox(
+        value: todo.done,
+        onChanged: busy ? null : (v) => onDoneChanged(v ?? false),
+      ),
+      title: Text(
+        todo.title.isEmpty ? '(untitled)' : todo.title,
+        style: todo.done
+            ? TextStyle(
+                decoration: TextDecoration.lineThrough,
+                color: Theme.of(context).colorScheme.outline,
+              )
+            : null,
+      ),
+      subtitle: Text(formatEditedAtLocal(todo.lastEditedAtMs)),
+      trailing: IconButton(
+        tooltip: 'Trash',
+        onPressed: busy ? null : onTrash,
+        icon: const Icon(Icons.delete_outline),
       ),
     );
   }

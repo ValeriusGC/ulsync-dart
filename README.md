@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-17 16:27:26 +0300  
-**Version:** 15  
+**Updated:** 2026-09-17 17:05:37 +0300  
+**Version:** 16  
 **Document type:** readme
 
 ## What this is
@@ -98,12 +98,12 @@ macOS or iOS simulator use `http://127.0.0.1:8080`. The `example/` app
 reads the same values from `--dart-define` so it is not an identity
 provider.
 
-To see a click move between two windows, run the `example/` app twice on
+To see a to-do move between two windows, run the `example/` app twice on
 macOS as described in [`example/README.md`](example/README.md): one build,
-two `open -n` launches, different Device ID values, one local server. The
-example uses a tap journal (`counter_operation`) instead of a single integer
-so concurrent pluses both arrive. An **Offline** switch per window queues
-local edits without closing the client.
+two `open -n` launches, different device names, one local server. The
+example is a **to-do list** with done, trash, and `writeAll` — not a tap
+counter. **Work offline** in the app bar queues local edits without closing
+the client.
 
 **`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
 prefixes such as `/api` are not supported; requests always go to

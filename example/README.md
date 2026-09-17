@@ -1,45 +1,40 @@
-# ulsync example
+# ulsync example — self-hosted to-do list
 
-**Created:** 2026-09-08 08:31:05 +0300  
-**Updated:** 2026-09-08 13:27:00 +0300  
-**Version:** 4  
+**Created:** 2026-09-17 17:05:37 +0300  
+**Updated:** 2026-09-17 17:05:37 +0300  
+**Version:** 1  
 **Document type:** readme
 
 ## What this is
 
-One person, two processes, one local server. The library example is a normal
-Flutter app launched twice on macOS — not seven panes in one window. Each plus
-button writes one immutable tap record; the on-screen number is the sum of
-those records. When you press plus in the phone window, the tablet window
-updates through the live feed without a refresh button.
+A **product-shaped** sample client, not a developer connect form. You choose
+your own `ulsync-server`, prove it with `GET /health`, sign in with an access
+key and `GET /v1/whoami`, then keep a to-do list in sync across two macOS
+windows. Text, done checkboxes, trash, restore, and **Move done to trash**
+(one `writeAll` batch) all ride the round-2 API: named parts (`full`, `done`,
+`deleted`) and batched push.
+
+Each window is a separate process with its own **device name** (`phone`,
+`tablet`) and metadata file. The session strip shows **Live · host:port** or
+**Offline · saved on this device** — never the bearer token.
 
 ## There is no cloud alice
 
-Everyone who clones this package runs **their own** `ulsync-server`. The JWT
-(JSON Web Token) subject `alice` is a local development label you mint with
-a shared secret — not a shared cloud account. `alice` on machine A and
-`alice` on machine B never meet unless you deliberately point both apps at
-the same server URL. If several people paste the same token into one public
-demo host, they become one user in that server's database. Production apps
-supply tokens from their own identity system; this example does not show a
-login screen.
+Everyone runs **their own** server on localhost. The JWT subject `alice` is a
+label you mint with the dev HMAC secret — not a shared account. Production apps
+get keys from their identity system; this sample only **pastes** a key.
 
 ## What you need
 
-- A checkout of [ulsync-server](https://github.com/ValeriusGC/ulsync-server)
-  running on your machine (Docker or `go run` — follow that repository's
-  README).
-- Go installed to mint a local HS256 token (see below).
-- This example (`example/` in the `ulsync-dart` repository).
-- For the two-window demo: macOS with Xcode tooling so `flutter build macos`
-  succeeds.
+- [ulsync-server](https://github.com/ValeriusGC/ulsync-server) on your machine
+- Go (to mint a local HS256 token)
+- macOS with Xcode tooling for `flutter build macos`
+- Two windows via `open -n` (not two `flutter run` sessions)
 
-## Mint a local token
+## Mint a local access key
 
-The server does not issue bearer tokens. Sign one locally with the development
-HMAC secret from your server `config.yaml` (`dev_hs256_secret: "local-dev-only"`).
-
-Create the helper once:
+The server does not issue bearer tokens. Sign one with
+`dev_hs256_secret: "local-dev-only"` in your server YAML:
 
 ```bash
 cat >/tmp/mint_dev_jwt.go <<'EOF'
@@ -70,67 +65,37 @@ func main() {
 	fmt.Print(s)
 }
 EOF
-```
 
-Run it from the `ulsync-server` directory (needs that repo's `go.mod`):
-
-```bash
 cd /path/to/ulsync-server
 export TOKEN=$(go run /tmp/mint_dev_jwt.go)
 echo "$TOKEN"
 ```
 
-Another subject (for example `bob`):
+## Pairing flow (two screens)
 
-```bash
-go run /tmp/mint_dev_jwt.go bob
-```
+1. **Your server** — `Server address`, **Continue** runs `GET …/health` (no
+   auth). On success you see the sign-in screen with the host in the subtitle.
+2. **Sign in** — `Access key` (bearer), **Device name** (`phone` / `tablet`),
+   **Sign in** runs `GET …/v1/whoami` first. On `401` the client does not
+   open. On success the menu shows `Signed in as alice` from `user_id`; there
+   is no User field on the form.
 
-The `User` field in the Connect form must match the token's `sub` claim.
+`--dart-define=ULSYNC_BASE_URL`, `ULSYNC_TOKEN`, and `ULSYNC_SOURCE_ID` may
+prefill fields (MDM-style); labels are still **Server address** / **Access
+key**, not Base URL / Token / Connect.
 
 ## Clean slate before a two-window run
 
-The library keeps a **separate metadata file per Device ID** (sync cursor,
-dirty queue). The example stores them under the macOS app sandbox. Wiping
-only the server's `./data/ulsync.db` **without** deleting these files used to
-leave the client cursor **ahead** of the server — live opened with
-`since=<local cursor>` and **skipped** new envelopes (tablet stayed at `0`
-while phone showed `pushed … cursor 18`). The engine **auto-heals** on Connect
-(`syncOnce`) and before live:
-
-1. Read local cursor `L` from the metadata file for this Device ID.
-2. Probe server feed head `H` with `pull(since: 0)` (server is read-only).
-3. When `L > H`, reset the local cursor and replay from the beginning
-   (idempotent apply).
-
-After a server-only reset, the two-window plus test works **without** deleting
-client metadata below. Deleting those files is still recommended for a
-perfectly clean demo. **Disconnect** does not remove metadata; quit the app
-(**Cmd+Q**) first.
-
-Other files in `ulsync-server/data/` (`ulsync-load.db`, ad-hoc names) are
-**not** the operator store; only `ulsync.db` matters for this demo.
+Quit all `ulsync_example.app` windows (**Cmd+Q**), then:
 
 ```bash
-# Quit all ulsync_example.app windows first (Cmd+Q).
-
-# Server store (stop ./ulsync-server with Ctrl+C before rm)
-cd /path/to/ulsync-server
-rm -f ./data/ulsync.db ./data/ulsync.db-wal ./data/ulsync.db-shm
-./ulsync-server -config config.yaml
-
-# Example metadata (one file per device id used in Connect)
 rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_phone.db
 rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_tablet.db
-rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_watch.db
 ```
 
-Rebuilding the server binary (`go build`) is **not** required for a clean run —
-only the database files above.
+Reset the server SQLite file you use in your YAML when you need an empty store.
 
-## Run two windows on macOS
-
-Build once, then open two separate processes with `open -n`:
+## Build and open two windows
 
 ```bash
 cd /path/to/ulsync-dart/example
@@ -139,63 +104,66 @@ export TOKEN=$(go run /tmp/mint_dev_jwt.go)   # from ulsync-server checkout
 flutter build macos --debug \
   --dart-define=ULSYNC_BASE_URL=http://127.0.0.1:8080 \
   --dart-define=ULSYNC_TOKEN="$TOKEN"
-open -n /path/to/ulsync-dart/example/build/macos/Build/Products/Debug/ulsync_example.app
-open -n /path/to/ulsync-dart/example/build/macos/Build/Products/Debug/ulsync_example.app
+open -n build/macos/Build/Products/Debug/ulsync_example.app
+open -n build/macos/Build/Products/Debug/ulsync_example.app
 ```
 
-In **window 1**: User `alice`, Device ID `phone`, paste the same token, Base
-URL `http://127.0.0.1:8080`, tap **Connect**.
+In window 1: **Continue** → Device name `phone` → **Sign in**.  
+In window 2: same server and key → Device name `tablet` → **Sign in**.
 
-In **window 2**: User `alice`, Device ID `tablet`, same token and URL, **Connect**.
+Both should show `Live · 127.0.0.1:8080` (or briefly `Connecting · …`).
 
-Press **+** in the phone window. The tablet counter becomes `1` without
-pressing refresh. Both windows show `1`. After the first plus, phone Events
-should show a **small** cursor (for example `cursor 1`), not a large number
-left over from an old metadata file.
+## Work offline
 
-Do not run two `flutter run` sessions against the same build output — they
-overwrite each other. Use one build and two `open -n` launches.
+The cloud icon in the app bar (**Work offline**) mutes **this window only**.
+It is not airplane mode. The engine has no pause: cancelling the live
+*subscription* does not stop ingest. This sample **closes** the client and
+reopens the same metadata file **without** `live()`, so local `write` /
+`writeAll` still queue. Going online again is `syncOnce` (push dirty, then
+pull) plus `live()`. Do not `syncOnce` on the way *into* offline — that
+would pull the remote edits the mute is meant to hold back.
 
-## Offline switch
+## Trash and batch
 
-The **Offline** switch mutes **this window only**. It is not macOS airplane
-mode and not Wi‑Fi off. Do not use airplane mode for this demo.
+- **Trash** on a row writes part `deleted` (row stays in the map; hidden from
+  the main list).
+- **Trash** screen → **Restore** writes `deleted: false` without clearing
+  **Done**.
+- **Move done to trash** sends every done, visible row in one `writeAll` — not
+  a loop of `write`.
 
-With phone **Offline**, press **+** twice. Phone shows `2`; tablet stays `0`.
-Turn phone **Online** again. Tablet should show `2`, not `1` — both taps were
-queued locally and flushed with `syncOnce`.
+## Manual acceptance (I1–I7)
 
-## A second person
+Use server `http://127.0.0.1:8080`, device names `phone` and `tablet`, JWT from
+`/tmp/mint_dev_jwt.go` with secret `local-dev-only`. Each scenario needs its
+own mint, YAML, server process, build, and client DB wipe. Details for operators
+live in the step-31 TEMP handoff in the triad HQ repo.
 
-Mint a token with subject `bob`, open a third window (`open -n` again), set
-User `bob`, Device ID `watch`, paste the bob token, **Connect**. The counter
-stays at `0` while alice's windows show `1` or more. A plus in alice's phone
-does not change bob's total.
+| ID | What you prove |
+|----|----------------|
+| I1 | New text appears on the other window live |
+| I2 | Done checkbox and edited time sync |
+| I3 | Trash hides from list, visible in Trash on both |
+| I4 | Restore keeps Done |
+| I5 | Offline done + online trash → both deleted and done |
+| I6 | Move done to trash batch on both windows |
+| I7 | Work offline queues edits; both windows converge after online |
 
-## Why both clicks arrive
-
-The server stores **records**, it does not add integers. Each plus creates a
-new tap with a unique `id` and `delta: 1`. The on-screen total is the sum of
-all deltas in the local journal. Last-write-wins on a single `{value: int}`
-field would drop one of two simultaneous pluses and look like broken sync.
-
-## Round 1 limitation
-
-Round 1 sends one envelope per `POST /v1/sync/push`. Three pluses are three
-HTTP requests. Batching is planned for a later round.
+Round 2 closes only after a human runs all seven on two windows. Green
+`flutter test` alone is not enough.
 
 ## Android emulator
 
-The default Base URL in code is `http://127.0.0.1:8080` (macOS loopback). Inside
-an Android emulator, `127.0.0.1` is the emulator itself, not your host machine.
-**You must pass:**
+Pass the host loopback for the emulator:
 
 ```bash
 flutter run --dart-define=ULSYNC_BASE_URL=http://10.0.2.2:8080 \
   --dart-define=ULSYNC_TOKEN="$TOKEN"
 ```
 
-`10.0.2.2` is the host loopback as seen from the emulator.
+Round-2 acceptance is macOS two-window; the emulator path is best-effort.
 
-Chrome against a local HTTP server is **not** supported: `ulsync-server` does
-not send CORS headers. Use macOS, iOS simulator, or the Android emulator.
+## Chrome / web
+
+Local HTTP without CORS is not supported for sync. Use macOS or a mobile
+simulator for server-backed runs.
