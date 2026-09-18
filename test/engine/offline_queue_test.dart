@@ -402,6 +402,30 @@ Future<void> _pumpUntil(bool Function() condition, {int max = 200}) async {
   fail('condition not met after $max event-loop yields');
 }
 
+/// Same as [_pumpUntil] for an async condition.
+///
+/// [FakeSyncTransport.push] records the call (and a scripted [onPush]
+/// counter) **before** the engine re-takes the serial lock to clear dirty.
+/// Waiting only on the counter races on a loaded CI runner.
+Future<void> _pumpUntilAsync(
+  Future<bool> Function() condition, {
+  int max = 200,
+}) async {
+  for (var i = 0; i < max; i++) {
+    if (await condition()) {
+      return;
+    }
+    await Future<void>.delayed(Duration.zero);
+  }
+  fail('async condition not met after $max event-loop yields');
+}
+
+/// Whether [id] exists in [h] and is no longer dirty.
+Future<bool> _isClean(_Harness h, String id) async {
+  final row = await h.stateOf(id);
+  return row != null && !row.dirty;
+}
+
 void main() {
   test(
     'write returns after persist when push throws; dirty stays; write does not throw',
@@ -489,7 +513,7 @@ void main() {
       await h.writeNote('e1', 'Milk');
       await _pumpUntil(() => h.fake.pushCalls.isNotEmpty);
       expect(h.fake.pushCalls.single.single.id, 'e1');
-      await _pumpUntil(() => (h.appStore['e1'] == 'Milk'));
+      await _pumpUntilAsync(() => _isClean(h, 'e1'));
       expect((await h.stateOf('e1'))!.dirty, isFalse);
     },
   );
@@ -515,6 +539,7 @@ void main() {
       h.fake.onConnectionState!(LiveConnectionState.restored);
       await _pumpUntil(() => h.fake.pushCalls.isNotEmpty);
       expect(h.fake.pushCalls.single.single.id, 'e1');
+      await _pumpUntilAsync(() => _isClean(h, 'e1'));
       expect((await h.stateOf('e1'))!.dirty, isFalse);
     },
   );
@@ -618,7 +643,10 @@ void main() {
       };
       await network.startLive();
       await network.writeNote('e1', 'Milk');
-      await _pumpUntil(() => networkPushes >= 2);
+      await _pumpUntilAsync(() async {
+        return networkPushes >= 2 && await _isClean(network, 'e1');
+      });
+      expect(networkPushes, greaterThanOrEqualTo(2));
       expect((await network.stateOf('e1'))!.dirty, isFalse);
     },
   );
@@ -642,6 +670,7 @@ void main() {
         (call) => call.any((envelope) => envelope.revision == 2),
       );
     });
+    await _pumpUntilAsync(() => _isClean(h, 'e1'));
     expect(h.appStore['e1'], 'v2');
     expect(
       h.fake.pushCalls.any(
