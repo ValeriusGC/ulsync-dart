@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-17 17:05:37 +0300  
-**Version:** 16  
+**Updated:** 2026-09-18 09:57:05 +0300  
+**Version:** 17  
 **Document type:** readme
 
 ## What this is
@@ -54,22 +54,15 @@ The first network call of each client is an origin handshake
 ```dart
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:ulsync/ulsync.dart';
 
-// On the web there is no documents directory: the path is just a store name.
-final databasePath = kIsWeb
-    ? 'ulsync.db'
-    : '${(await getApplicationDocumentsDirectory()).path}/ulsync.db';
-
-final client = UlsyncClient(
+final client = await UlsyncClient.open(
+  name: 'phone',
   baseUrl: Uri.parse('http://10.0.2.2:8080'),
   origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
   userScope: userId,
   sourceId: deviceId,
   tokenProvider: () async => supabase.auth.currentSession?.accessToken,
-  store: await SembastMetadataStore.open(databasePath: databasePath),
   adapters: [
     EntityAdapter<CounterOperation>(
       entityType: 'counter_operation',
@@ -78,6 +71,7 @@ final client = UlsyncClient(
       decode: (bytes, schemaVersion) => CounterOperation.fromJson(...),
       load: (String id) async => localOpLog.byId(id),
       apply: (op) async => localOpLog.upsert(op),
+      listIds: () async => localOpLog.allIds(),
     ),
   ],
 );
@@ -105,11 +99,28 @@ example is a **to-do list** with done, trash, and `writeAll` — not a tap
 counter. **Work offline** in the app bar queues local edits without closing
 the client.
 
+The application does **not** import `path_provider`, does not write
+`kIsWeb`, and does not pass a filesystem path. `name` is an
+installation-local label (`phone`, `tablet`), not a path and not
+`origin`. Two processes that share a name share a cursor and a stored
+`source_id`. The library picks IndexedDB on the web and an Application
+Support file on IO. Closing the client and opening again with the same
+`name` reopens that same metadata instance.
+
+**`name`.** Trimmed label: non-empty, `A–Z a–z 0–9 . _ -`, and it must
+not contain `..`. Anything else is `ArgumentError` before the database
+opens and before the network is touched.
+
+**`inMemory`.** Tests only. A VM `flutter test` that resolves a real
+support directory throws `MissingPluginException` from `path_provider`.
+Engine tests pass `inMemory: true`. The in-memory factory type is not
+part of the public API.
+
 **`baseUrl`.** Origin of the ulsync server (`http://host:port`). Path
 prefixes such as `/api` are not supported; requests always go to
 `/v1/sync/hello`, `/v1/sync/push`, `/v1/sync/pull`, and `/v1/sync/diff`.
 Ignored when a test supplies `transport`, but still required so production
-and tests share one constructor.
+and tests share one `open` shape.
 
 **`origin`.** Application-contour name sent as `Ulsync-Origin` (SPEC
 section 1.5). Required. Empty, blank, longer than 256 characters, or
@@ -138,22 +149,17 @@ to fail fast with `UlsyncUnauthorized` and no network call. The library
 does not refresh sessions; it re-reads whatever the application now
 holds.
 
-**`store`.** The library's metadata database (cursor, dirty queue,
-revision). The application chooses the path; the library chooses the
-sembast factory for the platform. See **Local metadata** below. Entity
-payloads are **not** copied here — `load` reads them from the
-application store at push time.
-
 **`adapters`.** One `EntityAdapter<T>` per `entity_type` the application
-understands. Duplicate types throw at construction. A type that arrives
-from the server with no adapter is skipped, the cursor still advances,
-and `SyncUnknownType` is emitted — a foreign type must not stop sync of
-the types you do own. Optional `listIds` lets the self-check compare
-application data with library metadata; without it that phase reports
-unavailable and everything else still works. Optional `encodePart` /
+understands. Duplicate types throw at `open`. A type that arrives from
+the server with no adapter is skipped, the cursor still advances, and
+`SyncUnknownType` is emitted — a foreign type must not stop sync of
+the types you do own. `listIds` is **required**: it must return every
+id of that type, including hidden rows, or local reconciliation cannot
+see the application's past. An empty list is legal (no records).
+Omitting the argument does not compile. Optional `encodePart` /
 `applyPart` send and apply named envelope parts other than `full`
-(see **Named parts**). Existing adapters without those fields keep
-compiling.
+(see **Named parts**). Those stay optional because an application
+without named slices may ship only `full`.
 
 **`apply` must be idempotent.** The application store and the metadata
 database are different databases. There is no transaction that covers
@@ -377,15 +383,17 @@ Three phases, in order:
    third conflict rank and two devices could keep different payloads
    forever (SPEC section 1.4). Restore the previous id, or if the
    change is intentional, delete the metadata file.
-2. **Application data vs library metadata.** Optional
+2. **Application data vs library metadata.** Required
    `EntityAdapter.listIds` returns every id of that type the
-   application stores — ids only, never payloads. For each id with no
-   metadata the library creates a row with `last_edited_at_ms = 1`,
-   `revision = 1`, and `dirty = true`. Time `1` is older than any real
-   edit and is legal on the wire (the server rejects `created_at_ms <= 0`).
-   If no adapter provides `listIds`, this phase reports itself
-   unavailable and the rest of sync still works. Existing adapters
-   keep compiling; the field is optional on purpose.
+   application stores — ids only, never payloads, including hidden
+   rows. For each id with no metadata the library creates a row with
+   `last_edited_at_ms = 1`, `revision = 1`, and `dirty = true`. Time
+   `1` is older than any real edit and is legal on the wire (the
+   server rejects `created_at_ms <= 0`). The phase is available when
+   the client has at least one adapter (`listIds` is always invoked).
+   It is unavailable only when `adapters` is empty. An empty
+   `listIds()` on a live adapter means reconciliation ran and found
+   nothing, not that the phase is off.
 3. **Library metadata vs the server.** `POST /v1/sync/diff` (SPEC
    section 3.4) sends `(id, part)` plus the **three** ranks of SPEC
    section 2, in batches of 500. The server answers `missing` (no row)
@@ -427,7 +435,7 @@ Listen to `live()` for `SyncEvent` values:
 - `SyncUnknownType` — log it; sync of known types continues.
 
 The application does not store the cursor or the send queue. Those live
-in `SembastMetadataStore`.
+in the library metadata file the `name` argument selects.
 
 ## Limitations of round 1
 
@@ -484,14 +492,14 @@ are still required when changing accounts (`userScope`).
 content at push time), bearer tokens, or any user identifier beyond the
 `userScope` string the application passes in.
 
-**Path vs implementation.** The application supplies `databasePath` — a file
-path on mobile and desktop, a store name in the browser. The library picks the
-platform `DatabaseFactory` internally via a conditional export, so the
-application writes no conditional import for storage.
-
-**Optional `factory`.** `SembastMetadataStore.open` accepts an optional
-`factory` for **application tests only** (for example
-`databaseFactoryMemory`). It is not how production code selects a platform.
+**Path vs implementation.** The application supplies `name`, not a path.
+On the web the library uses an IndexedDB store named `ulsync_<name>` and
+does not import `path_provider`. On IO it writes
+`{Application Support}/ulsync/<name>.db` (Support, not Documents: the
+file holds `source_id`, which must not restore onto a second phone
+through a documents backup). iOS backup exclusion of that Support
+directory via `NSURLIsExcludedFromBackupKey` is **not** set in this
+release.
 
 **`userScope` is mandatory.** Cursor and entity keys include `userScope`. If
 the application forgets to scope by signed-in user, the next account on the
@@ -504,35 +512,8 @@ test/store/metadata_store_measure_test.dart`). The whole database is held in
 memory while open, so treat hundreds of thousands of entities per user as out
 of scope for this release.
 
-**Mobile and desktop.** Pass a file path under the application documents
-directory (for example via `path_provider`):
-
-```dart
-final databasePath =
-    '${(await getApplicationDocumentsDirectory()).path}/ulsync.db';
-final store = await SembastMetadataStore.open(databasePath: databasePath);
-```
-
-**Browser.** There is no file system path — pass a store name:
-
-```dart
-const databasePath = 'ulsync.db';
-final store = await SembastMetadataStore.open(databasePath: databasePath);
-```
-
-The library picks `databaseFactoryIo` or `databaseFactoryWeb` internally; the
-application writes no conditional import for storage.
-
-**Application tests.** Pass an in-memory factory explicitly:
-
-```dart
-import 'package:sembast/sembast_memory.dart';
-
-final store = await SembastMetadataStore.open(
-  databasePath: 'test.db',
-  factory: databaseFactoryMemory,
-);
-```
+**Application tests.** Pass `inMemory: true` on `UlsyncClient.open`. Do
+not resolve a real support directory from `flutter test` on the VM.
 
 **Browser guarantee.** The store is exercised in Chrome on every CI run
 (`flutter test --platform chrome test/store/`), not merely claimed in this
