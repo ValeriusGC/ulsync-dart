@@ -14,7 +14,11 @@ sealed class SyncEvent {
   const SyncEvent();
 }
 
-/// Records that actually reached [EntityAdapter.apply] this time.
+/// Records that reached [EntityAdapter.apply] or [EntityAdapter.applyPart].
+///
+/// One event may name an id after any cell of its kit landed. Completeness
+/// still requires the rest of the kit; this event is not "the row is
+/// finished".
 final class SyncApplied extends SyncEvent {
   /// Wraps the [entities] just written to the application store.
   const SyncApplied(this.entities);
@@ -25,7 +29,10 @@ final class SyncApplied extends SyncEvent {
 
 /// One applied record: wire type and id.
 final class SyncedEntity {
-  /// Names one record that passed last-write-wins and [EntityAdapter.apply].
+  /// Names one record that passed last-write-wins and a domain apply.
+  ///
+  /// Identity is the id, not a finished kit: `done` of the same id may
+  /// still be in flight.
   const SyncedEntity({required this.entityType, required this.id});
 
   /// Wire `entity_type` of the applied record.
@@ -44,16 +51,25 @@ final class SyncCursorAdvanced extends SyncEvent {
   final int cursor;
 }
 
-/// The live HTTP stream dropped, timed out, or failed to open.
+/// The live HTTP stream dropped, timed out, failed to open, or catch-up
+/// [UlsyncClient.syncOnce] hit a transport error.
 ///
-/// Show a disconnected state. The library reopens the feed on its own. A
-/// scheduled JWT `exp` reopen is **not** this event.
+/// Show a disconnected / reconnecting state. Do **not** call
+/// [UlsyncClient.syncOnce] from this event: the engine already retries
+/// until the server answers. A scheduled JWT `exp` reopen is **not**
+/// this event. After laptop sleep the application still must call
+/// [UlsyncClient.notifyResumed] — this event cannot fire while the
+/// isolate is frozen.
 final class SyncConnectionLost extends SyncEvent {
   /// Creates a lost-connection event.
   const SyncConnectionLost();
 }
 
 /// A live HTTP response with a 2xx status was received, including first open.
+///
+/// Clear disconnected UI state. The engine then retries
+/// [UlsyncClient.syncOnce] until push/pull succeed; the application must
+/// not duplicate that catch-up here.
 final class SyncConnectionRestored extends SyncEvent {
   /// Creates a restored-connection event.
   const SyncConnectionRestored();

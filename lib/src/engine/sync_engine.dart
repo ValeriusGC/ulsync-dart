@@ -1,5 +1,10 @@
 /// Sync engine: dirty queue, last-write-wins apply, live feed, one mutex.
 ///
+/// A record kit (`full` plus every named part of one id) is **indivisible**
+/// and must be **complete**. Push, pull, and diff never cut that set at
+/// the SPEC ceiling of 500; ingest never drops a cell because another
+/// cell of the same id already applied.
+///
 /// Applications import [UlsyncClient] from `package:ulsync/ulsync.dart`.
 /// Envelopes never leave this library as [SyncEvent] payloads.
 /// @docImport '../transport/exceptions.dart';
@@ -17,21 +22,27 @@ import '../store/entity_state.dart';
 import '../store/instance_name.dart';
 import '../store/platform/metadata_path.dart';
 import '../store/sembast_metadata_store.dart';
+import '../transport/exceptions.dart';
 import '../transport/http_sync_transport.dart';
 import '../transport/sync_transport.dart';
 import 'entity_adapter.dart';
+import 'incoming_envelope_meta.dart';
 import 'lww.dart';
+import 'record_kit.dart';
 import 'self_check_report.dart';
 import 'sync_event.dart';
 import 'sync_report.dart';
 
-/// Default wire `part` for a complete snapshot of a record.
+/// Default wire `part` for snapshot columns of a record.
 ///
-/// SPEC section 1.1: identity is `(id, part)`. `full` is the complete
-/// snapshot. Any other non-empty string is an application-defined slice.
-/// The library keeps no registry of names and does not treat `done` or
-/// `deleted` as reserved. This is the default for [UlsyncClient.write]
-/// and [UlsyncClient.markChanged], not the only legal value.
+/// SPEC section 1.1: identity is `(id, part)`. `full`, `done`, `deleted`,
+/// and every other name are **equal cells** of one **indivisible,
+/// complete** kit. The application row is the union of every cell for
+/// that id, applied independently in feed order. `full` is the default
+/// for [UlsyncClient.write] and [UlsyncClient.markChanged], not a
+/// privileged snapshot that finishes the record. Last-write-wins never
+/// compares one part against another. A SPEC batch of 500 must not cut
+/// this kit in half.
 const String kEnvelopePart = 'full';
 
 /// Wire `payload_encoding`. Always `json` in round 1, even when the bytes
@@ -44,23 +55,37 @@ const String kPayloadEncoding = 'json';
 /// There is no tombstone type.
 const int kFlags = 0;
 
+/// SPEC maximum envelopes in one push, pull page, or diff request.
+///
+/// This is a ceiling, not a quota to fill. A record kit is **indivisible**:
+/// the engine sends fewer than 500 rather than split `full` / `done` /
+/// `deleted` of one id across two requests.
+const int kSpecBatchLimit = 500;
+
 /// Maximum dirty rows posted in one [UlsyncClient.syncOnce] drain.
 ///
-/// Matches the SPEC maximum for push, pull `limit`, and diff (500), so a
-/// hundred-row related edit leaves in one POST. The previous value 50 was
-/// the round-1 drain size while the loop still posted one envelope per
-/// request. A lower drain now would split a hundred-row [UlsyncClient.writeAll]
-/// across two [UlsyncClient.syncOnce] passes.
-const int kPushBatchLimit = 500;
+/// Matches [kSpecBatchLimit] so a hundred-row related edit leaves in one
+/// POST. The engine never fills those 500 by cutting a record kit:
+/// `full` and every named part of one id are an **indivisible, complete**
+/// set and travel together, even when that leaves the POST shorter than
+/// this ceiling. A lower drain would split a hundred-row
+/// [UlsyncClient.writeAll] across two [UlsyncClient.syncOnce] passes.
+const int kPushBatchLimit = kSpecBatchLimit;
 
 /// Page size for [SyncTransport.pull]. A full page triggers another request.
-const int kPullPageLimit = 100;
+///
+/// Matches [kSpecBatchLimit]. A full page still holds the trailing
+/// `(entityType, id)` so an **indivisible** kit that straddles the
+/// ceiling is not ingested without its remaining cells. Completeness
+/// forbids applying `full` and leaving `done` on the next page.
+const int kPullPageLimit = kSpecBatchLimit;
 
 /// Maximum keys in one `POST /v1/sync/diff` (SPEC section 3.4).
 ///
-/// Matches the maximum `limit` on pull so the client has one batch size
-/// for the whole protocol.
-const int kDiffBatchLimit = 500;
+/// Matches [kSpecBatchLimit]. Probes for one `id` are an **indivisible**
+/// kit: they are never split across two requests, even when that leaves
+/// a request shorter than 500.
+const int kDiffBatchLimit = kSpecBatchLimit;
 
 /// Mutable counters for one [UlsyncClient.syncOnce] pass.
 final class _SyncCounters {
@@ -90,6 +115,7 @@ final Object _writeZoneKey = Object();
 ///
 /// A related edit ("move done to trash") is several persist callbacks
 /// that must not be visible to live sync until every mark is written.
+/// Each [part] is one cell of an **indivisible, complete** kit.
 /// [UlsyncClient.writeAll] holds the same lock as a single
 /// [UlsyncClient.write] for the whole list, so the feed cannot POST the
 /// first five while item 100 is still being persisted. This type does
@@ -117,8 +143,9 @@ final class WriteOp {
 
   /// Envelope cell. Default [kEnvelopePart] (`full`).
   ///
-  /// Identity is `(id, part)`. A blank value after trim is [ArgumentError]
-  /// at [UlsyncClient.writeAll], not at construction.
+  /// Identity is `(id, part)`. One cell of an **indivisible, complete**
+  /// kit — `full` does not finish the record. A blank value after trim
+  /// is [ArgumentError] at [UlsyncClient.writeAll], not at construction.
   final String part;
 
   /// Application write for this item.
@@ -128,12 +155,40 @@ final class WriteOp {
   final Future<void> Function() persist;
 }
 
-/// End-to-end last-write-wins client: queue, pull, live, one lock.
+/// End-to-end last-write-wins client: the engine drives the wire.
 ///
-/// Open with [UlsyncClient.open]. The application records local edits with
-/// [write] (mark first, persist second, same lock) or [writeAll] for one
-/// related action that touches many rows. [markChanged] remains as a
-/// low-level primitive. [syncOnce] and [live] move data. The first network
+/// A record kit (`full` plus every named part of one id) is **indivisible**
+/// and must be **complete**. Open with [UlsyncClient.open]. Record local
+/// edits with [write] or [writeAll]. Call [live] once after sign-in — that
+/// starts the worry loop. Call [notifyResumed] when the **process** wakes;
+/// the engine cannot see Flutter lifecycle (`lib/` must not import
+/// `package:flutter`).
+///
+/// **The engine does, without being kicked:**
+///
+/// - Reopen the live SSE feed on drop, timeout, 5xx, and TCP death
+///   ([kReconnectInterval], silence watchdog).
+/// - Run [syncOnce] after every [SyncConnectionRestored] until push/pull
+///   succeed, so envelopes missed while the socket was down still land.
+/// - Restart [live] if the transport stream ends without [close].
+/// - Replay from `since=0` when the local cursor is ahead of the server,
+///   or when metadata still names any cell of a kit (`full` or a named
+///   part) that [EntityAdapter.load] no longer returns (sign-in cleared
+///   an in-memory journal). The whole kit is replayed; `full` alone is
+///   not a complete row.
+///
+/// **The engine cannot see, so the application must tell it:**
+///
+/// - App switcher, lock screen, laptop sleep, isolate freeze: Dart timers
+///   do not fire, a half-open TCP socket looks healthy, and the 45s
+///   silence watchdog is asleep too. Call [notifyResumed] from
+///   `WidgetsBindingObserver.didChangeAppLifecycleState` when the state
+///   is `AppLifecycleState.resumed`. That API drops the stale socket
+///   **now** and catch-up-retries [syncOnce]. Listen to
+///   [SyncConnectionLost] / [SyncConnectionRestored] for the strip; do
+///   not call [syncOnce] from those events — the engine already does.
+///
+/// [markChanged] remains as a low-level primitive. The first network
 /// action of each instance is SPEC section 3.5 hello, then the first
 /// [syncOnce] runs [selfCheck]. Protocol, HTTP, cursor, the metadata
 /// engine, and the send queue stay inside.
@@ -174,6 +229,16 @@ final class UlsyncClient {
   /// plan §13.9); this hook is the seam instead of `@visibleForTesting`,
   /// which would import Flutter into `lib/` and fail the import guard.
   ///
+  /// [catchUpRetryDelay] is the pause between [syncOnce] attempts after a
+  /// network miss on live restore or [notifyResumed]. Production keeps the
+  /// default. Tests pass [Duration.zero] so a scripted failure does not
+  /// wait a second.
+  ///
+  /// [pushBatchLimit] and [pullPageLimit] default to [kSpecBatchLimit].
+  /// Tests pass a smaller ceiling to prove a record kit is not split at
+  /// the batch edge. Production keeps the default. Values outside
+  /// `1…kSpecBatchLimit` throw [ArgumentError].
+  ///
   /// Throws [ArgumentError] when [name] fails [requireInstanceName], when
   /// [origin], [userScope], or [sourceId] are empty or illegal, or when
   /// [adapters] contains a duplicate [EntityAdapter.entityType]. Those
@@ -189,6 +254,9 @@ final class UlsyncClient {
     SyncTransport? transport,
     bool inMemory = false,
     Future<void> Function()? beforePersistIncoming,
+    Duration catchUpRetryDelay = const Duration(seconds: 1),
+    int pushBatchLimit = kPushBatchLimit,
+    int pullPageLimit = kPullPageLimit,
   }) async {
     final safeName = requireInstanceName(name);
     requireUlsyncOrigin(origin);
@@ -216,6 +284,9 @@ final class UlsyncClient {
       adapters: adapters,
       transport: transport,
       beforePersistIncoming: beforePersistIncoming,
+      catchUpRetryDelay: catchUpRetryDelay,
+      pushBatchLimit: pushBatchLimit,
+      pullPageLimit: pullPageLimit,
     );
   }
 
@@ -233,10 +304,20 @@ final class UlsyncClient {
     required List<EntityAdapter<dynamic>> adapters,
     SyncTransport? transport,
     this.beforePersistIncoming,
+    Duration catchUpRetryDelay = const Duration(seconds: 1),
+    int pushBatchLimit = kPushBatchLimit,
+    int pullPageLimit = kPullPageLimit,
   }) : origin = requireUlsyncOrigin(origin),
        userScope = _requireNonEmpty(userScope, 'userScope'),
        sourceId = _requireNonEmpty(sourceId, 'sourceId'),
        _adapters = _indexAdapters(adapters),
+       // ignore: prefer_initializing_formals
+       _catchUpRetryDelay = catchUpRetryDelay,
+       _pushBatchLimit = _requireSpecBatchLimit(
+         pushBatchLimit,
+         'pushBatchLimit',
+       ),
+       _pullPageLimit = _requireSpecBatchLimit(pullPageLimit, 'pullPageLimit'),
        _transport =
            transport ??
            HttpSyncTransport(
@@ -283,6 +364,19 @@ final class UlsyncClient {
   /// window. Production callers omit it. README and the example do not
   /// mention it.
   final Future<void> Function()? beforePersistIncoming;
+
+  /// Pause between catch-up [syncOnce] attempts after a transport miss.
+  ///
+  /// The engine keeps trying until the server answers or [close]. A 4xx
+  /// ([UlsyncUnauthorized], [UlsyncRequestRejected]) stops the loop: the
+  /// request is wrong, not "server down".
+  final Duration _catchUpRetryDelay;
+
+  /// Ceiling for one push. Record kits are packed to fit; they are not cut.
+  final int _pushBatchLimit;
+
+  /// Ceiling for one pull page. A full page holds the trailing record kit.
+  final int _pullPageLimit;
 
   /// Applied `server_seq`. Read by [SyncTransport.live]'s `appliedSince`
   /// synchronously — that callback must never call [_store.readCursor].
@@ -334,6 +428,9 @@ final class UlsyncClient {
   /// Completes when [_runLive] exits; awaited in [close] before store close.
   Future<void>? _liveDone;
 
+  /// In-flight catch-up after restore or [notifyResumed]. One at a time.
+  Completer<void>? _catchUpGate;
+
   /// Outward events. Broadcast so a late subscriber does not throw; events
   /// with no listener are dropped (subscribe before [syncOnce] if you need
   /// pull-time events).
@@ -364,10 +461,12 @@ final class UlsyncClient {
   ///
   /// [part] names the envelope cell. Default [kEnvelopePart] (`full`).
   /// The mark is keyed `(id, part)` the same way metadata already is.
-  /// A blank value after trim is [ArgumentError]. This method does not
-  /// require [EntityAdapter.encodePart]: it is the primitive that can
-  /// mark a slice the next push will refuse to encode. Prefer [write],
-  /// which throws [StateError] before marking when the encoder is missing.
+  /// Each cell belongs to an **indivisible, complete** kit: marking
+  /// `full` does not stand in for `done`. A blank value after trim is
+  /// [ArgumentError]. This method does not require
+  /// [EntityAdapter.encodePart]: it is the primitive that can mark a
+  /// slice the next push will refuse to encode. Prefer [write], which
+  /// throws [StateError] before marking when the encoder is missing.
   ///
   /// The engine owns the revision. The application must not mint it: a stale
   /// number loses a last-write-wins tie and the edit disappears silently.
@@ -413,11 +512,12 @@ final class UlsyncClient {
   ///
   /// [part] names the envelope cell. Default [kEnvelopePart] (`full`).
   /// Identity is `(id, part)`: a checkbox and a hide flag on the same
-  /// record are two rows, and last-write-wins does not cross between
-  /// them. A blank value after trim is [ArgumentError]. When [part] is not
-  /// `full` and the adapter has no [EntityAdapter.encodePart], this throws
-  /// [StateError] **before** the mark so [persist] does not run and an
-  /// unsendable row is not left behind.
+  /// record are two cells of one **indivisible, complete** kit, and
+  /// last-write-wins does not cross between them. A blank value after
+  /// trim is [ArgumentError]. When [part] is not `full` and the adapter
+  /// has no [EntityAdapter.encodePart], this throws [StateError]
+  /// **before** the mark so [persist] does not run and an unsendable row
+  /// is not left behind.
   ///
   /// The same serial lock covers [persist]. Releasing it between the mark
   /// and the application write would let a concurrent [syncOnce] observe
@@ -458,7 +558,10 @@ final class UlsyncClient {
   ///
   /// Use this for one user action that touches many rows ("move done to trash").
   /// Live sync and [syncOnce] wait until every persist finished, so the feed
-  /// cannot POST the first five while the rest are still being marked.
+  /// cannot POST the first five while the rest are still being marked. Each
+  /// [WriteOp.part] is one cell of an **indivisible** kit: `full` and `deleted`
+  /// of the same id must both be marked if both changed; the send queue will
+  /// not split that kit at the SPEC ceiling.
   ///
   /// An empty list is a no-op, not an error. If persist of item 5 throws, items
   /// 1–5 are marked dirty and 6…N have not started — the same contract as a
@@ -624,13 +727,17 @@ final class UlsyncClient {
 
   /// Pushes the dirty queue, then pulls until a short page.
   ///
-  /// On the first successful call of this instance, names [origin] to the
-  /// server ([_ensureOrigin]) and then runs [selfCheck] (identity, local
-  /// ids, server diff). Hello is first because self-check would otherwise
-  /// seed a foreign store. The existing push/pull body is unchanged: it is
-  /// the drain for marks the check just made. Neither hello nor [selfCheck]
-  /// is invoked from inside [_serialized] — the lock is not re-entrant,
-  /// and that call would hang forever.
+  /// Push posts **complete, indivisible** record kits: `full` and every
+  /// named part of one id travel in the same POST, even when that leaves
+  /// the request shorter than [kSpecBatchLimit]. Pull holds a trailing kit
+  /// on a full page so the set is not cut at the ceiling. On the first
+  /// successful call of this instance, names [origin] to the server
+  /// ([_ensureOrigin]) and then runs [selfCheck] (identity, local ids,
+  /// server diff). Hello is first because self-check would otherwise seed
+  /// a foreign store. The existing push/pull body is the drain for marks
+  /// the check just made. Neither hello nor [selfCheck] is invoked from
+  /// inside [_serialized] — the lock is not re-entrant, and that call
+  /// would hang forever.
   ///
   /// Before pull, the engine **auto-heals** when the stored cursor is ahead
   /// of the server feed head (see README, *Local metadata*). Push and pull run
@@ -665,6 +772,7 @@ final class UlsyncClient {
             final counters = _SyncCounters();
             await _pushDirty(counters);
             await _ensureCursorLoaded();
+            await _reconcileDomainBehindMetadata();
             await _reconcileCursorIfAhead();
             await _pullPages(counters);
             return SyncReport(
@@ -684,14 +792,17 @@ final class UlsyncClient {
         });
   }
 
-  /// Returns the outbound event stream, starting the live feed once.
+  /// Returns the outbound event stream and starts the live worry loop.
   ///
-  /// Synchronous: hello and HTTP start on a later microtask after
-  /// [_ensureOrigin], the applied cursor is loaded, and **auto-healed**
-  /// when ahead of the server feed head, so a foreign store is refused
-  /// before envelopes arrive and the first open does not send a stale
-  /// `since`. Reopens call `appliedSince` again and see the cursor as of
-  /// **now**, not as of the first [live] call.
+  /// Call this **once** after sign-in. The engine then reopens the feed
+  /// on its own until [close]. Hello and HTTP start on a later microtask
+  /// after [_ensureOrigin]. The applied cursor is loaded and auto-healed
+  /// when ahead of the server feed head. Reopens call `appliedSince`
+  /// again and see the cursor as of **now**, not as of the first [live]
+  /// call.
+  ///
+  /// This does **not** replace [notifyResumed]. A frozen isolate still
+  /// looks connected until the application reports a wake.
   Stream<SyncEvent> live() {
     _ensureOpen();
     if (!_liveStarted) {
@@ -699,6 +810,32 @@ final class UlsyncClient {
       _liveDone = _runLive();
     }
     return _events.stream;
+  }
+
+  /// Reports that this isolate is running in the foreground again.
+  ///
+  /// This is the **only** lifecycle kick the application owes the engine.
+  /// `lib/` must not import Flutter, so [UlsyncClient] cannot observe
+  /// `AppLifecycleState`. A suspended isolate does not run Dart timers:
+  /// the live silence watchdog sleeps, and a half-open TCP socket can
+  /// still look healthy. Without this call, catch-up waits until that
+  /// watchdog (45s after the isolate actually runs again) or until the
+  /// next local [write].
+  ///
+  /// Call from `WidgetsBindingObserver.didChangeAppLifecycleState` when
+  /// the state is `AppLifecycleState.resumed` (lock screen, app switcher,
+  /// laptop sleep, first frame after a killed isolate). Tests call it
+  /// when their host wakes. Do **not** call it on every [SyncEvent]; the
+  /// engine already catch-up-retries after [SyncConnectionRestored].
+  ///
+  /// Drops the current live body immediately ([SyncTransport.pokeLive]),
+  /// then runs [syncOnce] until push/pull succeed or [close]. Network
+  /// and HTTP `5xx` retry with backoff. [UlsyncUnauthorized] and other
+  /// 4xx stop the loop: the token or request is wrong.
+  Future<void> notifyResumed() async {
+    _ensureOpen();
+    await _transport.pokeLive();
+    await _catchUpUntilReachable();
   }
 
   /// Stops live ingest, then closes transport and store.
@@ -910,19 +1047,15 @@ final class UlsyncClient {
     }
     final verdicts = <DiffVerdict>[];
     var probed = 0;
-    for (
-      var offset = 0;
-      offset < collected.probes.length;
-      offset += kDiffBatchLimit
-    ) {
-      final end = offset + kDiffBatchLimit;
-      final chunk = collected.probes.sublist(
-        offset,
-        end > collected.probes.length ? collected.probes.length : end,
-      );
+    final chunks = packCompleteDiffKits(
+      collected.probes,
+      limit: kDiffBatchLimit,
+    );
+    for (var i = 0; i < chunks.length; i++) {
+      final chunk = chunks[i];
       final batch = await diffTransport.diff(chunk);
       if (batch == null) {
-        if (offset == 0) {
+        if (i == 0) {
           return unavailable;
         }
         break;
@@ -1007,14 +1140,42 @@ final class UlsyncClient {
     var since = 0;
     while (true) {
       _ensureOpen();
-      final page = await _transport.pull(since: since, limit: kPullPageLimit);
-      if (page.envelopes.length < kPullPageLimit) {
+      final page = await _transport.pull(since: since, limit: _pullPageLimit);
+      if (page.envelopes.length < _pullPageLimit) {
         return page.nextCursor;
       }
       if (page.nextCursor <= since) {
         return page.nextCursor;
       }
       since = page.nextCursor;
+    }
+  }
+
+  /// Replays the feed when library metadata remembers rows the app does not.
+  ///
+  /// The metadata file can outlive the in-memory domain: process restart, or
+  /// an application that clears its store on sign-in while keeping the same
+  /// [name]. A cursor already at the feed head makes [pull] return nothing
+  /// while [EntityAdapter.load] returns `null` for those ids. **Every**
+  /// stored cell counts — a kit is **complete** only as the union of `full`
+  /// and every named part; `done` / `deleted` are not optional footnotes.
+  /// Resetting the cursor and replaying is safe because apply is
+  /// idempotent.
+  Future<void> _reconcileDomainBehindMetadata() async {
+    if (_adapters.isEmpty) {
+      return;
+    }
+    final states = await _store.allStates(userScope);
+    for (final row in states) {
+      final adapter = _adapters[row.entityType];
+      if (adapter == null) {
+        continue;
+      }
+      if (await adapter.load(row.id) == null) {
+        await _store.resetCursor(userScope);
+        _appliedCursor = 0;
+        return;
+      }
     }
   }
 
@@ -1036,9 +1197,13 @@ final class UlsyncClient {
     _appliedCursor = 0;
   }
 
-  /// Sends up to [kPushBatchLimit] dirty rows in one [SyncTransport.push].
+  /// Sends one complete-kit push, at most [_pushBatchLimit] envelopes.
   ///
-  /// Dirty marks of posted rows are not cleared before that call returns.
+  /// Dirty rows are packed so `full` and every named part of one id are an
+  /// **indivisible, complete** kit in the same POST. The request may be
+  /// shorter than the SPEC ceiling; filling 500 by dropping the rest of a
+  /// kit is forbidden. Dirty marks of posted rows are not cleared before
+  /// that call returns.
   /// A thrown transport error (including HTTP 413) leaves every posted row
   /// dirty so the next [syncOnce] retries the same related edit. Clearing a
   /// prefix on the way in would drop half a [writeAll] after a dropped
@@ -1060,10 +1225,8 @@ final class UlsyncClient {
   /// new client against a server whose limit is still 1 is a named
   /// incompatibility, and two send paths would drift.
   Future<void> _pushDirty(_SyncCounters counters) async {
-    final batch = await _store.dirtyBatch(
-      userScope: userScope,
-      limit: kPushBatchLimit,
-    );
+    final dirty = await _store.allDirty(userScope);
+    final batch = packCompleteRecordKits(dirty, limit: _pushBatchLimit);
     if (batch.isEmpty) {
       return;
     }
@@ -1118,9 +1281,10 @@ final class UlsyncClient {
   /// nothing to send.
   ///
   /// [kEnvelopePart] uses [EntityAdapter.load] then [EntityAdapter.encode].
-  /// Any other part uses [EntityAdapter.encodePart]. Returning `null` is
-  /// the same contract as `load` returning `null`: the caller clears dirty
-  /// without POST.
+  /// Any other part uses [EntityAdapter.encodePart]. Each is one cell of
+  /// an **indivisible** kit; the packer already grouped them. Returning
+  /// `null` is the same contract as `load` returning `null`: the caller
+  /// clears dirty without POST.
   ///
   /// Throws [StateError] when [row.part] is not `full` and [encodePart] is
   /// missing. [write] already refuses that case before marking; this
@@ -1149,20 +1313,38 @@ final class UlsyncClient {
   }
 
   /// Pulls pages until a short page or a stuck cursor.
+  ///
+  /// Every ingested envelope is one cell of an **indivisible, complete**
+  /// kit. A full page holds the trailing `(entityType, id)` so `full` and
+  /// named parts that straddle [_pullPageLimit] are not cut. Applying
+  /// `full` does not complete the id.
   Future<void> _pullPages(_SyncCounters counters) async {
     while (true) {
       _ensureOpen();
       final sinceUsed = _appliedCursor;
       final page = await _transport.pull(
         since: sinceUsed,
-        limit: kPullPageLimit,
+        limit: _pullPageLimit,
       );
-      for (final envelope in page.envelopes) {
-        counters.pulled++;
-        await _ingest(envelope, countInReport: true, counters: counters);
+      if (page.envelopes.isEmpty) {
+        await _advanceCursor(page.nextCursor);
+        break;
       }
-      await _advanceCursor(page.nextCursor);
-      if (page.envelopes.length < kPullPageLimit) {
+      final ingestLength = pullIngestLength(page.envelopes, _pullPageLimit);
+      for (var i = 0; i < ingestLength; i++) {
+        counters.pulled++;
+        await _ingest(
+          page.envelopes[i],
+          countInReport: true,
+          counters: counters,
+        );
+      }
+      if (ingestLength == page.envelopes.length) {
+        await _advanceCursor(page.nextCursor);
+      } else if (_appliedCursor <= sinceUsed) {
+        break;
+      }
+      if (page.envelopes.length < _pullPageLimit) {
         break;
       }
       if (page.nextCursor <= sinceUsed) {
@@ -1173,12 +1355,20 @@ final class UlsyncClient {
 
   /// Applies one incoming envelope or skips it; always eligible to move cursor.
   ///
-  /// Last-write-wins compares **only** inside `(id, part)`. A newer `done`
-  /// does not beat a local `deleted`, and a newer `full` does not restore
-  /// a hidden row — those are different cells. Skips and unknown types must
-  /// **not** call [SembastMetadataStore.applyIncoming]: that method always
-  /// writes [EntityState] and would overwrite a newer local row with an
-  /// older envelope.
+  /// `full` and every named part are **equal cells** of one **indivisible,
+  /// complete** record kit. The complete row is the union of the set,
+  /// applied in feed order (the order those cells were created and
+  /// accepted). Last-write-wins compares **only** inside `(id, part)`: a
+  /// newer `done` does not beat a local `deleted`, and applying `full`
+  /// does not finish the id or license dropping `done` / `deleted`. The
+  /// only skip is a **strictly older** version of the **same** cell, so a
+  /// newer local edit of that slice is not overwritten. A three-rank tie
+  /// still applies — metadata remembering those ranks does not mean the
+  /// journal still holds the flags. Completeness forbids treating a tie as
+  /// "already applied". Skips and unknown types must **not** call
+  /// [SembastMetadataStore.applyIncoming]: that method always writes
+  /// [EntityState] and would overwrite a newer local row with an older
+  /// envelope.
   ///
   /// `full` uses [EntityAdapter.decode] then [EntityAdapter.apply]. Any
   /// other part uses [EntityAdapter.applyPart]. When [applyPart] is
@@ -1211,7 +1401,7 @@ final class UlsyncClient {
       part: envelope.part,
     );
     if (local != null &&
-        !incomingWins(
+        incomingIsStale(
           incomingLastEditedAtMs: envelope.lastEditedAtMs,
           incomingRevision: envelope.revision,
           incomingSourceId: envelope.sourceId,
@@ -1267,21 +1457,29 @@ final class UlsyncClient {
   /// Returns `true` when [EntityAdapter.apply] or [EntityAdapter.applyPart]
   /// ran. Returns `false` when [envelope.part] is not `full` and
   /// [applyPart] is omitted: the caller still persists metadata and
-  /// advances the cursor. Never compares one part against another.
+  /// advances the cursor. Never compares one part against another: each
+  /// cell of the **indivisible** kit is applied on its own.
   Future<bool> _applyIncomingDomain(
     EntityAdapter<dynamic> adapter,
     Envelope envelope,
   ) async {
+    final meta = IncomingEnvelopeMeta(
+      part: envelope.part,
+      createdAtMs: envelope.createdAtMs,
+      lastEditedAtMs: envelope.lastEditedAtMs,
+      revision: envelope.revision,
+      sourceId: envelope.sourceId,
+    );
     if (envelope.part == kEnvelopePart) {
       final value = adapter.decode(envelope.payload, envelope.schemaVersion);
-      await adapter.applyValue(value);
+      await adapter.applyIncomingValue(value, meta);
       return true;
     }
     final applyPart = adapter.applyPart;
     if (applyPart == null) {
       return false;
     }
-    await applyPart(envelope.id, envelope.part, envelope.payload);
+    await applyPart(envelope.id, envelope.part, envelope.payload, meta);
     return true;
   }
 
@@ -1347,30 +1545,38 @@ final class UlsyncClient {
   /// Hello runs first so a foreign store cannot apply envelopes on a live
   /// URL miss.
   Future<void> _runLive() async {
-    try {
-      await _ensureOrigin();
-      if (_closed) {
-        return;
-      }
-      await _serialized(() async {
-        await _ensureCursorLoaded();
-      });
-      if (_closed) {
-        return;
-      }
-      await for (final message in _transport.live(
-        appliedSince: () => _appliedCursor,
-        onConnectionState: _onConnectionState,
-      )) {
+    while (!_closed) {
+      try {
+        await _ensureOrigin();
         if (_closed) {
-          break;
+          return;
         }
-        await _serialized(() => _handleLiveMessage(message));
+        await _serialized(() async {
+          await _ensureCursorLoaded();
+        });
+        if (_closed) {
+          return;
+        }
+        await for (final message in _transport.live(
+          appliedSince: () => _appliedCursor,
+          onConnectionState: _onConnectionState,
+        )) {
+          if (_closed) {
+            break;
+          }
+          await _serialized(() => _handleLiveMessage(message));
+        }
+      } catch (e, st) {
+        if (!_closed && !_events.isClosed) {
+          _events.add(const SyncConnectionLost());
+          _events.addError(e, st);
+        }
       }
-    } catch (e, st) {
-      if (!_closed && !_events.isClosed) {
-        _events.addError(e, st);
+      if (_closed) {
+        return;
       }
+      // Transport stream ended without [close]; open the next subscription.
+      await Future<void>.delayed(const Duration(seconds: 3));
     }
   }
 
@@ -1399,7 +1605,58 @@ final class UlsyncClient {
         _events.add(const SyncConnectionLost());
       case LiveConnectionState.restored:
         _events.add(const SyncConnectionRestored());
+        unawaited(_catchUpUntilReachable());
     }
+  }
+
+  /// Runs [syncOnce] until the server answers or [close].
+  ///
+  /// Live reconnect is not enough: envelopes missed while the socket was
+  /// down (or while the isolate was frozen) need a pull. Concurrent calls
+  /// share one loop. [UlsyncUnauthorized] and [UlsyncRequestRejected] stop
+  /// retrying; transport and network errors keep trying.
+  Future<void> _catchUpUntilReachable() {
+    final existing = _catchUpGate;
+    if (existing != null) {
+      return existing.future;
+    }
+    final gate = Completer<void>();
+    _catchUpGate = gate;
+    unawaited(() async {
+      try {
+        var delay = _catchUpRetryDelay;
+        while (!_closed) {
+          try {
+            await syncOnce();
+            return;
+          } on UlsyncUnauthorized {
+            return;
+          } on UlsyncRequestRejected {
+            return;
+          } catch (_) {
+            if (_closed) {
+              return;
+            }
+            if (!_events.isClosed) {
+              _events.add(const SyncConnectionLost());
+            }
+            await Future<void>.delayed(delay);
+            final next = delay * 2;
+            delay = next > const Duration(seconds: 8)
+                ? const Duration(seconds: 8)
+                : next;
+          }
+        }
+      } finally {
+        if (identical(_catchUpGate, gate)) {
+          _catchUpGate = null;
+        }
+        if (!gate.isCompleted) {
+          gate.complete();
+        }
+      }
+    }());
+    return gate.future;
   }
 
   /// Adds [event] when the client is still open.
@@ -1418,6 +1675,18 @@ String _requireNonEmpty(String value, String name) {
     throw ArgumentError.value(value, name, 'must be non-empty');
   }
   return trimmed;
+}
+
+/// Rejects a batch ceiling outside `1…[kSpecBatchLimit]`.
+int _requireSpecBatchLimit(int value, String name) {
+  if (value < 1 || value > kSpecBatchLimit) {
+    throw ArgumentError.value(
+      value,
+      name,
+      'must be an integer in 1…$kSpecBatchLimit',
+    );
+  }
+  return value;
 }
 
 /// Indexes adapters by [EntityAdapter.entityType]; duplicate keys throw.

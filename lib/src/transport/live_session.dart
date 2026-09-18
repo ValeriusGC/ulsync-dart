@@ -105,6 +105,12 @@ final class LiveSession {
   /// Completes when the current body should be abandoned.
   Completer<_BodyEnd>? _bodyGate;
 
+  /// When true, the next [_waitThenRetry] returns immediately.
+  ///
+  /// Set by [nudge] so a wake-up does not sit on [kReconnectInterval]
+  /// after dropping a stale socket.
+  bool _skipBackoff = false;
+
   /// Live body subscription; cancelled on silence, exp, or [stop].
   StreamSubscription<String>? _bodySubscription;
 
@@ -136,6 +142,25 @@ final class LiveSession {
       }
       _onStopped();
     }
+  }
+
+  /// Drops the current body or backoff so the loop opens a new socket now.
+  ///
+  /// Does not set [_stopped]: the reconnect loop keeps running. Emits
+  /// [LiveConnectionState.lost] so the engine catch-up runs after the
+  /// next 2xx open. No-op after [stop] or transport [close].
+  void nudge() {
+    if (_halted) {
+      return;
+    }
+    _skipBackoff = true;
+    _emitConnection(LiveConnectionState.lost);
+    _wakeSleep();
+    final bodyGate = _bodyGate;
+    if (bodyGate != null && !bodyGate.isCompleted) {
+      bodyGate.complete(_BodyEnd.dropped);
+    }
+    unawaited(_cancelBody());
   }
 
   /// Aborts HTTP, timers, and backoff sleep. Safe to call more than once.
@@ -429,6 +454,10 @@ final class LiveSession {
   /// EventSource: wait a few seconds, then try again. The wait does not grow.
   Future<void> _waitThenRetry() async {
     if (_halted) {
+      return;
+    }
+    if (_skipBackoff) {
+      _skipBackoff = false;
       return;
     }
     await _sleep(_reconnectDelay);

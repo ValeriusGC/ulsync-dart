@@ -1,6 +1,10 @@
 /// Entity-level last-write-wins synchronization for Flutter applications.
 ///
-/// See the README for setup and the `protocol/` submodule for the wire format.
+/// A record kit is every envelope of one `(entityType, id)`: `full` plus
+/// every named part. That kit is **indivisible** and must be **complete** —
+/// no cell is optional, and no SPEC batch of 500 may cut it in half.
+/// See the README and the `protocol/` submodule for setup and the wire
+/// format.
 ///
 /// Applications talk to [UlsyncClient.open], [EntityAdapter], [WriteOp],
 /// [SyncReport], and [SyncEvent]. Related edits use [UlsyncClient.writeAll].
@@ -10,6 +14,7 @@
 library;
 
 export 'src/engine/entity_adapter.dart' show EntityAdapter;
+export 'src/engine/incoming_envelope_meta.dart' show IncomingEnvelopeMeta;
 export 'src/engine/sync_engine.dart' show UlsyncClient, WriteOp;
 export 'src/engine/self_check_report.dart' show SelfCheckReport;
 export 'src/protocol/origin.dart' show OriginMismatchException;

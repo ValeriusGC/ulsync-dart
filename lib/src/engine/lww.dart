@@ -1,5 +1,9 @@
 /// Last-write-wins comparison identical to the server upsert.
 ///
+/// Ranks compare inside one `(id, part)` cell only. They never declare a
+/// record kit complete because `full` won: `done` and `deleted` remain
+/// required cells of that **indivisible** set.
+///
 /// Not exported from `package:ulsync/ulsync.dart`. The application never
 /// chooses a winner; the engine does, with the same three ranks as SPEC
 /// section 2 and triad plan §13.5.
@@ -33,6 +37,37 @@ bool incomingWins({
     return incomingRevision > localRevision;
   }
   return _utf8Greater(incomingSourceId, localSourceId);
+}
+
+/// Whether [incoming] is strictly older than [local] and must not be applied.
+///
+/// Callers pass ranks of the **same** `(id, part)` cell. This function
+/// never decides that `full` makes `done` unnecessary: those are different
+/// cells of one **indivisible, complete** kit. A three-rank **tie** is not
+/// stale. Metadata already storing those ranks does not mean the journal
+/// still holds the flags. Only a strictly older version of this cell is
+/// ignored, so a newer local edit of this slice is not overwritten.
+bool incomingIsStale({
+  required int incomingLastEditedAtMs,
+  required int incomingRevision,
+  required String incomingSourceId,
+  required int localLastEditedAtMs,
+  required int localRevision,
+  required String localSourceId,
+}) {
+  if (incomingWins(
+    incomingLastEditedAtMs: incomingLastEditedAtMs,
+    incomingRevision: incomingRevision,
+    incomingSourceId: incomingSourceId,
+    localLastEditedAtMs: localLastEditedAtMs,
+    localRevision: localRevision,
+    localSourceId: localSourceId,
+  )) {
+    return false;
+  }
+  return incomingLastEditedAtMs != localLastEditedAtMs ||
+      incomingRevision != localRevision ||
+      incomingSourceId != localSourceId;
 }
 
 /// Whether [a] is strictly greater than [b] as UTF-8 byte strings.

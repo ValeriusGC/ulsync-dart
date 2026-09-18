@@ -1,7 +1,9 @@
 /// Transport to the sync server: push, pull, and the live feed.
 ///
 /// Exists so engine tests (step 14) can substitute a fake without starting
-/// a process. Round 1 has one implementation: HttpSyncTransport.
+/// a process. Round 1 has one implementation: HttpSyncTransport. Record-kit
+/// packing (**indivisible**, **complete**) is the engine's job; this
+/// layer posts and parses the bytes.
 library;
 
 import '../protocol/envelope.dart';
@@ -9,11 +11,14 @@ import '../protocol/errors.dart';
 
 /// Transport to the sync server.
 ///
-/// Exists so engine tests (step 14) can substitute a fake without starting
-/// a process. Round 1 has one implementation: HttpSyncTransport.
+/// Push and pull carry **indivisible, complete** record kits packed by
+/// the engine. Exists so engine tests can substitute a fake without
+/// starting a process. Round 1 has one implementation: HttpSyncTransport.
 abstract interface class SyncTransport {
   /// POSTs envelopes to `/v1/sync/push`.
   ///
+  /// The engine packs **indivisible, complete** record kits before this
+  /// call: `full` and every named part of one id travel together.
   /// `applied: false` is success, not an exception: the server already holds
   /// a row that is not inferior (SPEC section 7).
   Future<List<PushResult>> push(List<Envelope> envelopes);
@@ -43,6 +48,15 @@ abstract interface class SyncTransport {
     void Function(LiveConnectionState state)? onConnectionState,
   });
 
+  /// Drops a half-open live socket so the reconnect loop opens a new one now.
+  ///
+  /// A process that was suspended (lock screen, app switcher, laptop sleep)
+  /// does not fire the silence watchdog. TCP can look healthy until the OS
+  /// notices. [UlsyncClient.notifyResumed] calls this, then [syncOnce].
+  /// A transport with no live session is a no-op. Does not complete the
+  /// outward live stream.
+  Future<void> pokeLive();
+
   /// Cancels the live stream, closes the HTTP client, rejects later calls.
   Future<void> close();
 }
@@ -63,7 +77,8 @@ final class PushResult {
   /// Envelope id echoed from the request.
   final String id;
 
-  /// Envelope part echoed from the request (round 1: `full`).
+  /// Envelope part echoed from the request. One cell of an **indivisible**
+  /// kit; round-1 fixtures often use `full`.
   final String part;
 
   /// Whether the server stored the envelope.
@@ -86,6 +101,10 @@ final class PushResult {
 }
 
 /// One immediate pull page: envelopes plus the server's `next_cursor`.
+///
+/// A full page may hold a trailing record kit so `full` and `done` of one
+/// id stay **indivisible**. The engine, not this type, decides how many
+/// envelopes of [envelopes] to ingest.
 ///
 /// The cursor of an empty page is the value the **server** sent, not a
 /// client-computed `since`. A missing `next_cursor` is a protocol error.
@@ -219,7 +238,8 @@ final class DiffProbe {
   /// Record identity, as in SPEC section 1.1.
   final String id;
 
-  /// Slice; identity is `(id, part)`. Round 1 always `full`.
+  /// Envelope cell. Identity is `(id, part)`. One cell of an
+  /// **indivisible, complete** kit; `full` is not privileged.
   final String part;
 
   /// First rank of SPEC section 2, as the **client** holds it.

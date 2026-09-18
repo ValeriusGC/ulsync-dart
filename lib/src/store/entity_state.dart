@@ -1,8 +1,10 @@
 /// Immutable local metadata for one entity part.
 ///
-/// This is not entity content — the application adapter owns payloads. The
-/// library only tracks what it needs to sync: timestamps, revision, dirty
-/// flag, and schema version.
+/// One metadata row is one cell of a record kit. The kit (`full` plus
+/// every named part of that id) is **indivisible** and must be
+/// **complete**. This is not entity content — the application adapter
+/// owns payloads. The library only tracks what it needs to sync:
+/// timestamps, revision, dirty flag, and schema version.
 library;
 
 /// What the library knows about one entity locally.
@@ -33,9 +35,10 @@ final class EntityState {
   /// Stable entity identifier (wire field `id`).
   final String id;
 
-  /// Envelope part name. Opaque key string, not a letter type. `full` is
-  /// the complete snapshot; any other non-empty value is an application
-  /// slice. Last-write-wins compares inside `(id, part)` only.
+  /// Envelope part name. Opaque key, not a letter type. `full` and every
+  /// other name are equal cells of one **indivisible, complete** kit;
+  /// last-write-wins compares inside `(id, part)` only and never treats
+  /// `full` as the whole row.
   final String part;
 
   /// Creation time as Unix epoch milliseconds (wire `created_at_ms`).

@@ -2,13 +2,18 @@
 ///
 /// The metadata store holds revision, dirty, and cursor — not payload bytes.
 /// [load] and [apply] are the path for part `full`. [encodePart] and
-/// [applyPart] are the path for every other name. The engine never copies
-/// payload into its own database.
+/// [applyPart] are the path for every other name. Those paths are equal
+/// cells of one **indivisible, complete** kit: the application row is the
+/// union of `full` and every named part. Missing a cell is an incomplete
+/// record, not an optimization. The engine never copies payload into its
+/// own database.
 ///
 /// @docImport 'sync_engine.dart';
 library;
 
 import 'dart:typed_data';
+
+import 'incoming_envelope_meta.dart';
 
 /// How the engine reads and writes one application entity type [T].
 ///
@@ -69,15 +74,17 @@ final class EntityAdapter<T> {
   /// without contacting the server. That is not an error.
   final Future<T?> Function(String id) load;
 
-  /// Writes a **full snapshot** [value] into the application store.
+  /// Writes snapshot columns of [value] into the application store.
   ///
   /// Runs only for incoming [kEnvelopePart]. Named slices use [applyPart].
-  /// This callback **must not** write fields that travel as their own parts
-  /// (checkbox, hide flag, and so on). Last-write-wins already keeps those
-  /// cells independent on the wire; writing them from `full` makes a newer
-  /// snapshot restore a hidden row or clear a checkbox the library cannot
-  /// see. The library does not inspect which columns you touch — the
-  /// adapter is the contract.
+  /// This is one cell of an **indivisible, complete** kit, not the whole
+  /// row: a successful [apply] does not mean `done` / `deleted` may be
+  /// skipped. This callback **must not** write fields that travel as their
+  /// own parts (checkbox, hide flag, and so on). Last-write-wins already
+  /// keeps those cells independent on the wire; writing them from `full`
+  /// makes a newer snapshot restore a hidden row or clear a checkbox the
+  /// library cannot see. The library does not inspect which columns you
+  /// touch — the adapter is the contract.
   ///
   /// **Must be idempotent.** The application database and the library
   /// metadata database are different files; no transaction covers both. The
@@ -94,19 +101,27 @@ final class EntityAdapter<T> {
   /// record forever after the same crash: the cursor has moved, the payload
   /// is gone, and no later sync can see it. The engine does not use that
   /// order.
-  final Future<void> Function(T value) apply;
+  ///
+  /// [meta] carries SPEC edit ranks from the envelope. Use
+  /// [IncomingEnvelopeMeta.lastEditedAtMs] for list order and subtitles
+  /// so two devices show the same row after sync. Do not substitute local
+  /// wall clock at apply time.
+  final Future<void> Function(T value, IncomingEnvelopeMeta meta) apply;
 
   /// Returns the ids of every record of this type the application stores.
   ///
   /// Required. Include hidden rows: an id missing from this list looks like
-  /// a deletion to the library, not a hide. Ids only: the library never
-  /// asks for payload here. An empty list is legal and means reconciliation
-  /// ran and found nothing. Without this callback the engine cannot see the
-  /// application's past, so the argument is not optional.
+  /// a deletion to the library, not a hide. Completeness of a kit is not
+  /// "listed iff `full` exists" — a row that only has `done` still has this
+  /// id. Ids only: the library never asks for payload here. An empty list
+  /// is legal and means reconciliation ran and found nothing. Without this
+  /// callback the engine cannot see the application's past, so the argument
+  /// is not optional.
   final Future<List<String>> Function() listIds;
 
   /// Optional encoder for a named envelope part other than [kEnvelopePart].
   ///
+  /// Each named part is an equal cell of an **indivisible, complete** kit.
   /// The engine never invents part names. Hide is an application slice, not
   /// a letter type the library understands. There is no tombstone type.
   /// When [UlsyncClient.write] is called with `part` not equal to `full`,
@@ -121,12 +136,19 @@ final class EntityAdapter<T> {
   /// Optional applier for a named envelope part other than [kEnvelopePart].
   ///
   /// Incoming `full` still uses [decode] and [apply]. This callback is the
-  /// only path into the application store for any other part name. The engine
-  /// never invents part names. A foreign name when this callback is omitted
-  /// does **not** fail the exchange: the cursor still advances, the part's
-  /// metadata is stored so the envelope is not replayed forever, and the
-  /// domain is left untouched. There is no tombstone type.
-  final Future<void> Function(String id, String part, Uint8List payload)?
+  /// only path into the application store for any other part name, and that
+  /// name is an equal cell of an **indivisible, complete** kit: the engine
+  /// does not drop it because `full` already ran. The engine never invents
+  /// part names. A foreign name when this callback is omitted does **not**
+  /// fail the exchange: the cursor still advances, the part's metadata is
+  /// stored so the envelope is not replayed forever, and the domain is left
+  /// untouched. There is no tombstone type.
+  final Future<void> Function(
+    String id,
+    String part,
+    Uint8List payload,
+    IncomingEnvelopeMeta meta,
+  )?
   applyPart;
 
   /// Encodes [value] after a cast to [T].
@@ -137,5 +159,6 @@ final class EntityAdapter<T> {
   Uint8List encodeValue(Object? value) => encode(value as T);
 
   /// Applies [value] after a cast to [T]. See [encodeValue] for why.
-  Future<void> applyValue(Object? value) => apply(value as T);
+  Future<void> applyIncomingValue(Object? value, IncomingEnvelopeMeta meta) =>
+      apply(value as T, meta);
 }

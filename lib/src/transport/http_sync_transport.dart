@@ -2,7 +2,9 @@
 ///
 /// Keep-alive needs that single client: a new client per request would
 /// handshake TCP and TLS every few minutes. Token is read before every
-/// request because the application may have rotated it.
+/// request because the application may have rotated it. Kit packing
+/// (**indivisible**, **complete** record kits) happens in the engine
+/// before [push] and after [pull]; this type posts and parses bytes.
 library;
 
 import 'dart:async';
@@ -259,6 +261,13 @@ final class HttpSyncTransport
     );
     _liveSession = session;
     return controller.stream;
+  }
+
+  /// Drops the active live body if any. See [SyncTransport.pokeLive].
+  @override
+  Future<void> pokeLive() async {
+    _ensureOpen();
+    _liveSession?.nudge();
   }
 
   /// Cancels the live stream and closes the HTTP client.
