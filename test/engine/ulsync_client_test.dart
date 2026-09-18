@@ -7,28 +7,13 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 import 'package:ulsync/ulsync.dart';
 
 import 'fake_sync_transport.dart';
 
 /// Monotonic suffix so parallel tests never share a database name.
 var _pathCounter = 0;
-
-/// Opens a fresh in-memory metadata store and deletes it when the test ends.
-Future<SembastMetadataStore> openMemoryStore() async {
-  final factory = databaseFactoryMemory;
-  final path = 'engine_test_${_pathCounter++}.db';
-  await factory.deleteDatabase(path);
-  final store = await SembastMetadataStore.open(
-    databasePath: path,
-    factory: factory,
-  );
-  addTearDown(() async {
-    await store.close();
-    await factory.deleteDatabase(path);
-  });
-  return store;
-}
 
 /// Test entity: id plus text so [EntityAdapter.apply] can upsert by id.
 final class _Memo {
@@ -120,17 +105,19 @@ final class _Harness {
     Completer<void>? applyGate,
     void Function()? onApplyEntered,
   }) async {
-    final store = await openMemoryStore();
+    final factory = databaseFactoryMemory;
+    final name = 'engine_test_${_pathCounter++}';
+    await factory.deleteDatabase(name);
     final fake = FakeSyncTransport();
     final appStore = <String, String>{};
     final applyCount = <int>[0];
-    final client = UlsyncClient(
+    final client = await UlsyncClient.open(
+      name: name,
       baseUrl: Uri.parse('http://engine.test'),
       origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
       userScope: 'alice',
       sourceId: 'device-a',
       tokenProvider: () async => 'test-token',
-      store: store,
       adapters: [
         EntityAdapter<_Memo>(
           entityType: 'note',
@@ -152,10 +139,16 @@ final class _Harness {
             applyCount[0]++;
             appStore[memo.id] = memo.text;
           },
+          listIds: () async => appStore.keys.toList(growable: false),
         ),
       ],
       transport: fake,
+      inMemory: true,
       beforePersistIncoming: beforePersistIncoming,
+    );
+    final store = await SembastMetadataStore.open(
+      databasePath: name,
+      factory: factory,
     );
     final harness = _Harness(
       store: store,
@@ -166,6 +159,7 @@ final class _Harness {
     );
     addTearDown(() async {
       await harness.client.close();
+      await factory.deleteDatabase(name);
     });
     return harness;
   }

@@ -3,7 +3,8 @@ library;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sembast/sembast_memory.dart';
-import 'package:ulsync/ulsync.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 
 /// Monotonic suffix so parallel tests never share a database name.
 var _pathCounter = 0;

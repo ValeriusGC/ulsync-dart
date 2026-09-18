@@ -6,6 +6,8 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 import 'package:ulsync/ulsync.dart';
 
 import 'fake_diff_transport.dart';
@@ -14,19 +16,30 @@ import 'fake_sync_transport.dart';
 /// Monotonic suffix so parallel tests never share a database name.
 var _pathCounter = 0;
 
-Future<SembastMetadataStore> _openStore() async {
+/// In-memory metadata file plus the instance name [UlsyncClient.open] uses.
+final class _Db {
+  /// Creates a named in-memory store handle.
+  _Db({required this.name, required this.store});
+
+  /// Instance name, also the memory-database key.
+  final String name;
+
+  /// Direct store handle for seeding and clock assertions.
+  final SembastMetadataStore store;
+}
+
+Future<_Db> _openStore() async {
   final factory = databaseFactoryMemory;
-  final path = 'self_check_${_pathCounter++}.db';
-  await factory.deleteDatabase(path);
+  final name = 'self_check_${_pathCounter++}';
+  await factory.deleteDatabase(name);
   final store = await SembastMetadataStore.open(
-    databasePath: path,
+    databasePath: name,
     factory: factory,
   );
   addTearDown(() async {
-    await store.close();
-    await factory.deleteDatabase(path);
+    await factory.deleteDatabase(name);
   });
-  return store;
+  return _Db(name: name, store: store);
 }
 
 final class _Memo {
@@ -51,7 +64,7 @@ EntityAdapter<_Memo> _adapter({
   Future<List<String>> Function()? listIds,
   int Function()? onListIds,
 }) {
-  final enumerate = listIds;
+  final enumerate = listIds ?? () async => appStore.keys.toList();
   return EntityAdapter<_Memo>(
     entityType: 'note',
     schemaVersion: 1,
@@ -67,31 +80,30 @@ EntityAdapter<_Memo> _adapter({
     apply: (memo) async {
       appStore[memo.id] = memo.text;
     },
-    listIds: enumerate == null
-        ? null
-        : () async {
-            onListIds?.call();
-            return enumerate();
-          },
+    listIds: () async {
+      onListIds?.call();
+      return enumerate();
+    },
   );
 }
 
-UlsyncClient _client({
-  required SembastMetadataStore store,
+Future<UlsyncClient> _client({
+  required String name,
   required SyncTransport transport,
   required EntityAdapter<_Memo> adapter,
   String userScope = 'alice',
   String sourceId = 'device-a',
-}) {
-  final client = UlsyncClient(
+}) async {
+  final client = await UlsyncClient.open(
+    name: name,
     baseUrl: Uri.parse('http://self-check.test'),
     origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
     userScope: userScope,
     sourceId: sourceId,
     tokenProvider: () async => 'test-token',
-    store: store,
     adapters: [adapter],
     transport: transport,
+    inMemory: true,
   );
   addTearDown(client.close);
   return client;
@@ -121,34 +133,32 @@ EntityState _row({
 }
 
 void main() {
-  test('adapter without listIds reports local unavailable and syncOnce still '
-      'pushes', () async {
-    final store = await _openStore();
+  test('local phase is unavailable when the client has no adapters', () async {
     final fake = FakeSyncTransport();
-    final appStore = <String, String>{'e1': 'hello'};
-    final client = _client(
-      store: store,
+    final client = await UlsyncClient.open(
+      name: 'empty_adapters_${_pathCounter++}',
+      baseUrl: Uri.parse('http://self-check.test'),
+      origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
+      userScope: 'alice',
+      sourceId: 'device-a',
+      tokenProvider: () async => 'test-token',
+      adapters: const [],
       transport: fake,
-      adapter: _adapter(appStore: appStore),
+      inMemory: true,
     );
-    final check = await client.selfCheck();
+    addTearDown(client.close);
+    final check = await client.selfCheck(includeServer: false);
     expect(check.localAvailable, isFalse);
     expect(check.localMarked, 0);
-    expect(check.serverAvailable, isFalse);
     expect(fake.pushCalls, isEmpty);
-    expect(fake.pullCalls, isEmpty);
-    await client.markChanged(entityType: 'note', id: 'e1');
-    final report = await client.syncOnce();
-    expect(report.pushed, 1);
-    expect(fake.pushCalls, hasLength(1));
   });
 
   test('unknown application id is marked with time 1 and revision 1', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeDiffTransport();
     final appStore = <String, String>{'e1': 'hello'};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: appStore, listIds: () async => ['e1']),
     );
@@ -166,7 +176,8 @@ void main() {
   test(
     'missing server key is marked without changing the conflict clock',
     () async {
-      final store = await _openStore();
+      final db = await _openStore();
+      final store = db.store;
       final before = _row(
         createdAtMs: 1_111,
         lastEditedAtMs: 2_222,
@@ -178,8 +189,8 @@ void main() {
         DiffVerdict(id: 'e1', part: 'full', gap: DiffGap.missing),
       ];
       final appStore = <String, String>{'e1': 'hello'};
-      final client = _client(
-        store: store,
+      final client = await _client(
+        name: db.name,
         transport: fake,
         adapter: _adapter(appStore: appStore),
       );
@@ -208,7 +219,8 @@ void main() {
   test(
     'stale server key is marked without changing the conflict clock',
     () async {
-      final store = await _openStore();
+      final db = await _openStore();
+      final store = db.store;
       final before = _row(
         createdAtMs: 5_000,
         lastEditedAtMs: 9_000,
@@ -227,8 +239,8 @@ void main() {
         ),
       ];
       final appStore = <String, String>{'e1': 'hello'};
-      final client = _client(
-        store: store,
+      final client = await _client(
+        name: db.name,
         transport: fake,
         adapter: _adapter(appStore: appStore),
       );
@@ -250,7 +262,8 @@ void main() {
   test(
     'diff probe carries all three ranks from metadata without loss',
     () async {
-      final store = await _openStore();
+      final db = await _openStore();
+      final store = db.store;
       await store.put(
         _row(lastEditedAtMs: 1756100000000, revision: 3, sourceId: 'device-a'),
       );
@@ -260,8 +273,8 @@ void main() {
         seen = List<DiffProbe>.from(probes);
         return const [];
       };
-      final client = _client(
-        store: store,
+      final client = await _client(
+        name: db.name,
         transport: fake,
         adapter: _adapter(appStore: {}),
       );
@@ -279,12 +292,13 @@ void main() {
   test(
     'diff returning null makes the server phase unavailable without throwing',
     () async {
-      final store = await _openStore();
+      final db = await _openStore();
+      final store = db.store;
       await store.put(_row());
       final fake = FakeDiffTransport();
       fake.onDiff = (probes) async => null;
-      final client = _client(
-        store: store,
+      final client = await _client(
+        name: db.name,
         transport: fake,
         adapter: _adapter(appStore: {'e1': 'hello'}),
       );
@@ -298,11 +312,12 @@ void main() {
   );
 
   test('transport without SyncDiffTransport skips the server phase', () async {
-    final store = await _openStore();
+    final db = await _openStore();
+    final store = db.store;
     await store.put(_row());
     final fake = FakeSyncTransport();
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: {}),
     );
@@ -314,11 +329,11 @@ void main() {
 
   test('includeServer false runs local and does not call diff', () async {
     var listCalls = 0;
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeDiffTransport();
     final appStore = <String, String>{'e1': 'hello'};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(
         appStore: appStore,
@@ -337,10 +352,11 @@ void main() {
   test(
     'first open stores source_id; a second open with the same id succeeds',
     () async {
-      final store = await _openStore();
+      final db = await _openStore();
+      final store = db.store;
       final fake = FakeSyncTransport();
-      final client = _client(
-        store: store,
+      final client = await _client(
+        name: db.name,
         transport: fake,
         adapter: _adapter(appStore: {}),
       );
@@ -355,23 +371,25 @@ void main() {
   test(
     'changed source_id throws StateError naming both values and repeats',
     () async {
-      final store = await _openStore();
-      final first = _client(
-        store: store,
+      final db = await _openStore();
+      final first = await _client(
+        name: db.name,
         transport: FakeSyncTransport(),
         adapter: _adapter(appStore: {}),
       );
       await first.selfCheck(includeServer: false);
-      final second = UlsyncClient(
+      final second = await UlsyncClient.open(
+        name: db.name,
         baseUrl: Uri.parse('http://self-check.test'),
         origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
         userScope: 'alice',
         sourceId: 'device-b',
         tokenProvider: () async => 'test-token',
-        store: store,
         adapters: [_adapter(appStore: {})],
         transport: FakeSyncTransport(),
+        inMemory: true,
       );
+      addTearDown(second.close);
       Future<void> expectIdentityError(Future<void> Function() call) async {
         await expectLater(
           call(),
@@ -394,11 +412,12 @@ void main() {
     'self-check on first syncOnce runs listIds and diff only once',
     () async {
       var listCalls = 0;
-      final store = await _openStore();
+      final db = await _openStore();
+      final store = db.store;
       await store.put(_row());
       final fake = FakeDiffTransport();
-      final client = _client(
-        store: store,
+      final client = await _client(
+        name: db.name,
         transport: fake,
         adapter: _adapter(
           appStore: {'e1': 'hello'},
@@ -416,7 +435,8 @@ void main() {
   test('failed first syncOnce retries self-check on the next call', () async {
     var listCalls = 0;
     var pulls = 0;
-    final store = await _openStore();
+    final db = await _openStore();
+    final store = db.store;
     await store.put(_row());
     final fake = FakeDiffTransport();
     fake.onPull = ({required int since, int? limit}) async {
@@ -426,8 +446,8 @@ void main() {
       }
       return PullPage(envelopes: const [], nextCursor: since);
     };
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(
         appStore: {'e1': 'hello'},
@@ -446,13 +466,14 @@ void main() {
   });
 
   test('501 known records are probed in batches of 500 and 1', () async {
-    final store = await _openStore();
+    final db = await _openStore();
+    final store = db.store;
     for (var i = 0; i < 501; i++) {
       await store.put(_row(id: 'e$i', lastEditedAtMs: i, revision: 1));
     }
     final fake = FakeDiffTransport();
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: {}),
     );
@@ -465,12 +486,13 @@ void main() {
   });
 
   test('selfCheck completes without deadlocking on the serial lock', () async {
-    final store = await _openStore();
+    final db = await _openStore();
+    final store = db.store;
     await store.put(_row());
     final fake = FakeDiffTransport();
     final appStore = <String, String>{'e1': 'hello'};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: appStore, listIds: () async => ['e1']),
     );
@@ -479,7 +501,8 @@ void main() {
   }, timeout: const Timeout(Duration(seconds: 5)));
 
   test('records of another userScope are not enumerated or probed', () async {
-    final store = await _openStore();
+    final db = await _openStore();
+    final store = db.store;
     await store.put(_row(id: 'alice-row', lastEditedAtMs: 10));
     await store.put(
       _row(userScope: 'bob', id: 'bob-row', lastEditedAtMs: 99, revision: 8),
@@ -490,8 +513,8 @@ void main() {
       seen = List<DiffProbe>.from(probes);
       return const [];
     };
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: {}),
     );

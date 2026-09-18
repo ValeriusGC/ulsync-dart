@@ -5,7 +5,8 @@ library;
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ulsync/ulsync.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 
 /// Set with `--dart-define=ULSYNC_MEASURE=true`.
 const _enabled = bool.fromEnvironment('ULSYNC_MEASURE');
