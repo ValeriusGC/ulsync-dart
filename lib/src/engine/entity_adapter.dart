@@ -12,15 +12,18 @@ import 'dart:typed_data';
 
 /// How the engine reads and writes one application entity type [T].
 ///
-/// Register each adapter once on [UlsyncClient.new]. The engine looks them
+/// Register each adapter once on [UlsyncClient.open]. The engine looks them
 /// up by [entityType], which must match the wire `entity_type`.
 final class EntityAdapter<T> {
   /// Creates an adapter for one [entityType].
   ///
   /// [entityType] after trim must be non-empty. Duplicate types are rejected
   /// by the client, not here, because only the client sees the full list.
-  /// [listIds], [encodePart], and [applyPart] are optional: existing adapters
-  /// keep compiling without them.
+  /// [listIds] is required: without a full id list the local self-check
+  /// cannot see records the application already stores, including hidden
+  /// rows. An empty list is legal (no records). Omitting the argument does
+  /// not compile. [encodePart] and [applyPart] stay optional because an
+  /// application without named slices may ship only `full`.
   EntityAdapter({
     required this.entityType,
     required this.schemaVersion,
@@ -28,7 +31,7 @@ final class EntityAdapter<T> {
     required this.decode,
     required this.load,
     required this.apply,
-    this.listIds,
+    required this.listIds,
     this.encodePart,
     this.applyPart,
   }) {
@@ -95,12 +98,12 @@ final class EntityAdapter<T> {
 
   /// Returns the ids of every record of this type the application stores.
   ///
-  /// Optional. When absent, the library cannot compare its metadata with the
-  /// application's data, and reconciliation reports itself unavailable instead
-  /// of failing. Ids only: the library never asks for payload here. Include
-  /// hidden rows: an id missing from this list looks like a deletion to the
-  /// library, not a hide.
-  final Future<List<String>> Function()? listIds;
+  /// Required. Include hidden rows: an id missing from this list looks like
+  /// a deletion to the library, not a hide. Ids only: the library never
+  /// asks for payload here. An empty list is legal and means reconciliation
+  /// ran and found nothing. Without this callback the engine cannot see the
+  /// application's past, so the argument is not optional.
+  final Future<List<String>> Function() listIds;
 
   /// Optional encoder for a named envelope part other than [kEnvelopePart].
   ///

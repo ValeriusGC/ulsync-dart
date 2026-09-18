@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-17 17:05:37 +0300  
-**Version:** 18  
+**Updated:** 2026-09-18 10:13:46 +0300  
+**Version:** 19  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -10,6 +10,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+
+### Changed
+
+- **Breaking.** The only public way to construct a client is
+  `UlsyncClient.open(name: …)`. `name` is an installation-local label,
+  not a filesystem path. The generative constructor and the metadata
+  store field are private. `SembastMetadataStore` and `EntityState` are
+  no longer exported from `package:ulsync/ulsync.dart`. Callers that
+  imported those types or passed `store:` will not compile.
+- **Breaking.** `EntityAdapter.listIds` is required. Local
+  reconciliation cannot be switched off by omitting the callback. An
+  empty list is legal. `SelfCheckReport.localAvailable` is `false` only
+  when the client has no adapters.
+- The library resolves the metadata location itself: IndexedDB
+  `ulsync_<name>` on the web (no `path_provider`), Application Support
+  `{support}/ulsync/<name>.db` on IO. `path_provider` `^2.1.6` is a
+  package dependency (lock `2.1.6`); applications do not call it. Engine
+  tests pass
+  `inMemory: true` so VM `flutter test` never hits
+  `MissingPluginException`.
+- iOS still backs up Application Support unless the app sets
+  `NSURLIsExcludedFromBackupKey`. This release does not set that flag.
+- The round-1 constructor compatibility test is removed. There is no
+  published-package duty to keep the unpublished constructor compiling.
+- The dirty queue posts up to 500 envelopes in one `POST /v1/sync/push`
+  (`kPushBatchLimit` matches the SPEC maximum). Marks clear only after
+  that response, including `applied: false`. A thrown transport error
+  leaves posted marks set. HTTP 413 is not retried as single-envelope
+  POSTs.
+- Self-check of unknown local ids uses time `1` (not `0`): older than any
+  real edit, and the server accepts it. Time `0` was rejected on push, so
+  G4 never healed.
+- Live reconnect waits a fixed few seconds like EventSource; the wait does
+  not grow. Live headers time out after 5 seconds when the server is down.
+  `live()` no longer pulls before opening the feed.
 
 ### Added
 
@@ -33,7 +68,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `UlsyncClient.selfCheck`: three-phase anti-entropy (installation identity,
   application ids vs metadata, metadata vs `POST /v1/sync/diff`). Runs once
   per client on the first `syncOnce`. Marking an already-known row does not
-  change its conflict clock. `listIds` on the adapter is optional.
+  change its conflict clock. `listIds` on the adapter is required.
 - `UlsyncClient.write`: marks a record dirty before the application persist
   callback runs, under the same serial lock, so a local edit cannot miss the
   send queue. `markChanged` stays as the low-level primitive.
@@ -44,20 +79,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Example application: two-window self-hosted to-do with done, trash,
   restore, session strip (host, not token), Immich-style pairing, and
   **Move done to trash** via `writeAll`. Tap journal removed.
-
-### Changed
-
-- The dirty queue posts up to 500 envelopes in one `POST /v1/sync/push`
-  (`kPushBatchLimit` matches the SPEC maximum). Marks clear only after
-  that response, including `applied: false`. A thrown transport error
-  leaves posted marks set. HTTP 413 is not retried as single-envelope
-  POSTs.
-- Self-check of unknown local ids uses time `1` (not `0`): older than any
-  real edit, and the server accepts it. Time `0` was rejected on push, so
-  G4 never healed.
-- Live reconnect waits a fixed few seconds like EventSource; the wait does
-  not grow. Live headers time out after 5 seconds when the server is down.
-  `live()` no longer pulls before opening the feed.
 
 ## [0.1.0] - 2026-09-04
 

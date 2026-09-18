@@ -20,6 +20,9 @@ dependencies:
   # no native code.
   sembast_web: ^2.4.5
   http: ^1.6.0
+  # Application Support directory on IO. The web resolver does not import this
+  # package (conditional export). Applications do not depend on it themselves.
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:

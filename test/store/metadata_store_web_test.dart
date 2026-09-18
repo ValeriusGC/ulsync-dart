@@ -3,7 +3,8 @@
 library;
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ulsync/ulsync.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 
 /// Monotonic suffix so browser runs do not share IndexedDB names.
 var _pathCounter = 0;

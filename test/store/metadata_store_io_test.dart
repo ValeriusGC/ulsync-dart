@@ -5,7 +5,8 @@ library;
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ulsync/ulsync.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 
 void main() {
   test('cursor and dirty flags survive close and reopen on a file', () async {

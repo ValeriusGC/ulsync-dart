@@ -6,6 +6,8 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 import 'package:ulsync/ulsync.dart';
 
 import 'fake_hello_transport.dart';
@@ -15,19 +17,30 @@ const _origin = 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f';
 
 var _pathCounter = 0;
 
-Future<SembastMetadataStore> _openStore() async {
+/// In-memory metadata file plus the instance name [UlsyncClient.open] uses.
+final class _Db {
+  /// Creates a named in-memory store handle.
+  _Db({required this.name, required this.store});
+
+  /// Instance name, also the memory-database key.
+  final String name;
+
+  /// Direct store handle for seeding.
+  final SembastMetadataStore store;
+}
+
+Future<_Db> _openStore() async {
   final factory = databaseFactoryMemory;
-  final path = 'origin_handshake_${_pathCounter++}.db';
-  await factory.deleteDatabase(path);
+  final name = 'origin_handshake_${_pathCounter++}';
+  await factory.deleteDatabase(name);
   final store = await SembastMetadataStore.open(
-    databasePath: path,
+    databasePath: name,
     factory: factory,
   );
   addTearDown(() async {
-    await store.close();
-    await factory.deleteDatabase(path);
+    await factory.deleteDatabase(name);
   });
-  return store;
+  return _Db(name: name, store: store);
 }
 
 final class _Memo {
@@ -52,7 +65,7 @@ EntityAdapter<_Memo> _adapter({
   Future<List<String>> Function()? listIds,
   int Function()? onListIds,
 }) {
-  final enumerate = listIds;
+  final enumerate = listIds ?? () async => appStore.keys.toList();
   return EntityAdapter<_Memo>(
     entityType: 'note',
     schemaVersion: 1,
@@ -68,32 +81,31 @@ EntityAdapter<_Memo> _adapter({
     apply: (memo) async {
       appStore[memo.id] = memo.text;
     },
-    listIds: enumerate == null
-        ? null
-        : () async {
-            onListIds?.call();
-            return enumerate();
-          },
+    listIds: () async {
+      onListIds?.call();
+      return enumerate();
+    },
   );
 }
 
-UlsyncClient _client({
-  required SembastMetadataStore store,
+Future<UlsyncClient> _client({
+  required String name,
   required SyncTransport transport,
   required EntityAdapter<_Memo> adapter,
   String origin = _origin,
   String userScope = 'alice',
   String sourceId = 'device-a',
-}) {
-  final client = UlsyncClient(
+}) async {
+  final client = await UlsyncClient.open(
+    name: name,
     baseUrl: Uri.parse('http://origin.test'),
     origin: origin,
     userScope: userScope,
     sourceId: sourceId,
     tokenProvider: () async => 'test-token',
-    store: store,
     adapters: [adapter],
     transport: transport,
+    inMemory: true,
   );
   addTearDown(client.close);
   return client;
@@ -113,40 +125,40 @@ void main() {
   test(
     'empty or illegal origin throws ArgumentError and does not call hello',
     () async {
-      final store = await _openStore();
       final fake = FakeHelloTransport();
       final adapter = _adapter(appStore: {});
 
-      UlsyncClient build(String origin) {
-        return UlsyncClient(
+      Future<UlsyncClient> build(String origin) {
+        return UlsyncClient.open(
+          name: 'origin_illegal',
           baseUrl: Uri.parse('http://origin.test'),
           origin: origin,
           userScope: 'alice',
           sourceId: 'device-a',
           tokenProvider: () async => 'test-token',
-          store: store,
           adapters: [adapter],
           transport: fake,
+          inMemory: true,
         );
       }
 
-      expect(() => build(''), throwsA(isA<ArgumentError>()));
-      expect(() => build('   '), throwsA(isA<ArgumentError>()));
-      expect(() => build('has space'), throwsA(isA<ArgumentError>()));
-      expect(() => build('bad@char'), throwsA(isA<ArgumentError>()));
-      expect(() => build('a' * 257), throwsA(isA<ArgumentError>()));
+      await expectLater(build(''), throwsA(isA<ArgumentError>()));
+      await expectLater(build('   '), throwsA(isA<ArgumentError>()));
+      await expectLater(build('has space'), throwsA(isA<ArgumentError>()));
+      await expectLater(build('bad@char'), throwsA(isA<ArgumentError>()));
+      await expectLater(build('a' * 257), throwsA(isA<ArgumentError>()));
       expect(fake.helloCalls, isEmpty);
       expect(fake.callOrder, isEmpty);
     },
   );
 
   test('hello null lets syncOnce reach push and pull', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeHelloTransport();
     fake.onHello = (_) async => null;
     final appStore = <String, String>{'e1': 'hello'};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: appStore),
     );
@@ -160,7 +172,7 @@ void main() {
 
   test('hello 409 throws OriginMismatchException before self-check', () async {
     var listCalls = 0;
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeHelloTransport();
     fake.onHello = (_) async {
       throw OriginMismatchException(
@@ -168,8 +180,8 @@ void main() {
         requestOrigin: 'com.example.other/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
       );
     };
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(
         appStore: {'e1': 'hello'},
@@ -204,8 +216,8 @@ void main() {
 
   test('hello is recorded before the first diff and the first push', () async {
     var listCalls = 0;
-    final store = await _openStore();
-    await store.put(
+    final db = await _openStore();
+    await db.store.put(
       EntityState(
         userScope: 'alice',
         entityType: 'note',
@@ -221,8 +233,8 @@ void main() {
     );
     final fake = FakeHelloTransport();
     final appStore = <String, String>{'e1': 'clean', 'e2': 'dirty'};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(
         appStore: appStore,
@@ -243,10 +255,10 @@ void main() {
   });
 
   test('two syncOnce calls invoke hello once', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeHelloTransport();
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: {}),
     );
@@ -256,7 +268,7 @@ void main() {
   });
 
   test('failed hello is retried on the next syncOnce', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeHelloTransport();
     var hellos = 0;
     fake.onHello = (_) async {
@@ -266,8 +278,8 @@ void main() {
       }
       return HelloResult(origin: _origin, userId: 'alice');
     };
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: {}),
     );
@@ -281,7 +293,7 @@ void main() {
   });
 
   test('live on 409 throws and does not open the feed', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeHelloTransport();
     fake.onHello = (_) async {
       throw OriginMismatchException(
@@ -289,8 +301,8 @@ void main() {
         requestOrigin: 'com.example.other/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
       );
     };
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: {}),
     );
@@ -309,11 +321,11 @@ void main() {
   });
 
   test('transport without SyncHelloTransport still exchanges', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeSyncTransport();
     final appStore = <String, String>{'e1': 'hello'};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: appStore),
     );
@@ -326,19 +338,19 @@ void main() {
   test(
     'second client with another userScope and the same origin leaves the first intact',
     () async {
-      final storeA = await _openStore();
-      final storeB = await _openStore();
+      final dbA = await _openStore();
+      final dbB = await _openStore();
       final fakeA = FakeHelloTransport();
       final fakeB = FakeHelloTransport();
       final appA = <String, String>{'e1': 'alice-row'};
-      final clientA = _client(
-        store: storeA,
+      final clientA = await _client(
+        name: dbA.name,
         transport: fakeA,
         adapter: _adapter(appStore: appA),
         userScope: 'alice',
       );
-      final clientB = _client(
-        store: storeB,
+      final clientB = await _client(
+        name: dbB.name,
         transport: fakeB,
         adapter: _adapter(appStore: {}),
         userScope: 'bob',
@@ -359,11 +371,11 @@ void main() {
   );
 
   test('write does not call hello', () async {
-    final store = await _openStore();
+    final db = await _openStore();
     final fake = FakeHelloTransport();
     final appStore = <String, String>{};
-    final client = _client(
-      store: store,
+    final client = await _client(
+      name: db.name,
       transport: fake,
       adapter: _adapter(appStore: appStore),
     );

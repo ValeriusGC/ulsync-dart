@@ -1,9 +1,11 @@
 /// Report from one [UlsyncClient.selfCheck] run.
 ///
 /// Each phase says whether it was available. Unavailable is a supported
-/// configuration (no `listIds`, old server, transport without the check),
-/// not an error.
+/// configuration for the **server** phase (old server, transport without
+/// the check, `includeServer: false`). It is not how a forgotten
+/// [EntityAdapter.listIds] looks: that callback is required.
 ///
+/// @docImport 'entity_adapter.dart';
 /// @docImport 'sync_engine.dart';
 library;
 
@@ -21,7 +23,12 @@ final class SelfCheckReport {
     required this.remainingDirty,
   });
 
-  /// Whether at least one adapter provided `listIds`.
+  /// Whether the local phase ran.
+  ///
+  /// `true` when the client has at least one adapter: [EntityAdapter.listIds]
+  /// is required and is always invoked. `false` only when `adapters` is
+  /// empty. An empty `listIds()` on a live adapter still reports `true`
+  /// (reconciliation ran and found nothing).
   final bool localAvailable;
 
   /// Application ids that had no metadata and were created with time `0`.

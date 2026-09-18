@@ -10,6 +10,8 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:ulsync/src/store/entity_state.dart';
+import 'package:ulsync/src/store/sembast_metadata_store.dart';
 import 'package:ulsync/ulsync.dart';
 
 import 'fake_sync_transport.dart';
@@ -118,26 +120,18 @@ final class _NoteHarness {
   /// Opens a note client with an injected fake transport.
   static Future<_NoteHarness> open() async {
     final factory = databaseFactoryMemory;
-    final path = 'write_all_notes_${_pathCounter++}.db';
+    final path = 'write_all_notes_${_pathCounter++}';
     await factory.deleteDatabase(path);
-    final store = await SembastMetadataStore.open(
-      databasePath: path,
-      factory: factory,
-    );
-    addTearDown(() async {
-      await store.close();
-      await factory.deleteDatabase(path);
-    });
 
     final fake = FakeSyncTransport();
     final appStore = <String, String>{};
-    final client = UlsyncClient(
+    final client = await UlsyncClient.open(
+      name: path,
       baseUrl: Uri.parse('http://engine.test'),
       origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
       userScope: 'alice',
       sourceId: 'device-a',
       tokenProvider: () async => 'test-token',
-      store: store,
       adapters: [
         EntityAdapter<_Memo>(
           entityType: 'note',
@@ -154,11 +148,20 @@ final class _NoteHarness {
           apply: (memo) async {
             appStore[memo.id] = memo.text;
           },
+          listIds: () async => appStore.keys.toList(growable: false),
         ),
       ],
       transport: fake,
+      inMemory: true,
     );
-    addTearDown(client.close);
+    final store = await SembastMetadataStore.open(
+      databasePath: path,
+      factory: factory,
+    );
+    addTearDown(() async {
+      await client.close();
+      await factory.deleteDatabase(path);
+    });
 
     return _NoteHarness(
       store: store,
@@ -205,26 +208,18 @@ final class _TaskHarness {
   /// Opens a three-column task client.
   static Future<_TaskHarness> open() async {
     final factory = databaseFactoryMemory;
-    final path = 'write_all_tasks_${_pathCounter++}.db';
+    final path = 'write_all_tasks_${_pathCounter++}';
     await factory.deleteDatabase(path);
-    final store = await SembastMetadataStore.open(
-      databasePath: path,
-      factory: factory,
-    );
-    addTearDown(() async {
-      await store.close();
-      await factory.deleteDatabase(path);
-    });
 
     final fake = FakeSyncTransport();
     final domain = <String, _Task>{};
-    final client = UlsyncClient(
+    final client = await UlsyncClient.open(
+      name: path,
       baseUrl: Uri.parse('http://engine.test'),
       origin: 'com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f',
       userScope: 'alice',
       sourceId: 'device-a',
       tokenProvider: () async => 'test-token',
-      store: store,
       adapters: [
         EntityAdapter<_Task>(
           entityType: 'task',
@@ -236,6 +231,7 @@ final class _TaskHarness {
             final row = domain.putIfAbsent(task.id, () => _Task(id: task.id));
             row.title = task.title;
           },
+          listIds: () async => domain.keys.toList(growable: false),
           encodePart: (id, part) async {
             final row = domain[id];
             if (row == null) {
@@ -262,8 +258,12 @@ final class _TaskHarness {
         ),
       ],
       transport: fake,
+      inMemory: true,
     );
-    addTearDown(client.close);
+    addTearDown(() async {
+      await client.close();
+      await factory.deleteDatabase(path);
+    });
 
     return _TaskHarness(fake: fake, client: client, domain: domain);
   }
