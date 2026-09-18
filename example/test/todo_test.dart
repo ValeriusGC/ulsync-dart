@@ -141,6 +141,17 @@ void main() {
         startsWith('Live ·'),
       );
     });
+
+    test('Store outage copy is reconnecting, not Work offline', () {
+      expect(
+        SessionStatus.reconnecting.bannerLine(host: '127.0.0.1:8080'),
+        'Reconnecting · 127.0.0.1:8080',
+      );
+      expect(
+        SessionStatus.reconnecting.bannerLine(host: '127.0.0.1:8080'),
+        isNot('Offline · saved on this device'),
+      );
+    });
   });
 
   group('safeDeviceId', () {

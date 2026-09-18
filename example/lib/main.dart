@@ -143,6 +143,10 @@ final class _TodosRootPageState extends State<TodosRootPage>
     }
   }
 
+  /// Maps engine events to strip text. [SessionStatus.offline] is only Work offline.
+  ///
+  /// [SyncConnectionLost] while mute is off is [SessionStatus.reconnecting], never
+  /// the Offline copy — a killed store must not look like the cloud button.
   SessionStatus _deriveSessionStatus() {
     if (_workOffline) {
       return SessionStatus.offline;
@@ -231,7 +235,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
   /// [UlsyncClient.close]. Cancelling the app's [StreamSubscription] does
   /// not stop that loop (round-1 live trap): remote trash would still land
   /// in the journal while the strip said Offline, and I5 would be untestable.
-  /// There is no `pauseLive` on the engine in this step.
+  /// The engine cannot pause the live feed in this step.
   ///
   /// Close + [UlsyncClient.open] with the **same** [name] is the mute that
   /// still allows [UlsyncClient.write] / [UlsyncClient.writeAll] (I6, I8).
@@ -446,6 +450,11 @@ final class _TodosRootPageState extends State<TodosRootPage>
     return '$_deviceName-$micros-$_todoSequence';
   }
 
+  /// Adds a row after local persist. Catch-up is the engine's job while live runs.
+  ///
+  /// [UlsyncClient.write] returns after persist and does not throw
+  /// [UlsyncNetworkException]. Calling [UlsyncClient.syncOnce] here would teach
+  /// authors that Milk was not saved until HTTP answered.
   Future<void> _addTodo() async {
     final client = _client;
     if (client == null || _busy) {
@@ -458,6 +467,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
     final id = _nextTodoId();
     setState(() {
       _busy = true;
+      _formError = null;
     });
     try {
       await client.write(
@@ -469,16 +479,11 @@ final class _TodosRootPageState extends State<TodosRootPage>
         },
       );
       _newTodoController.clear();
-      if (!_workOffline) {
-        await client.syncOnce();
-      }
     } catch (e) {
       if (mounted) {
         setState(() {
+          // Persist or closed-client failures only; write does not throw network.
           _formError = '$e';
-          if (!_workOffline) {
-            _sessionStatus = SessionStatus.unreachable;
-          }
         });
       }
     } finally {
@@ -490,6 +495,10 @@ final class _TodosRootPageState extends State<TodosRootPage>
     }
   }
 
+  /// Toggles done after local persist; the engine drains while live runs.
+  ///
+  /// A store outage is [SessionStatus.reconnecting] on the strip, not a form
+  /// error: the checkbox already changed in [TodoJournal].
   Future<void> _setDone(String id, bool done) async {
     final client = _client;
     if (client == null || _busy) {
@@ -497,6 +506,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
     }
     setState(() {
       _busy = true;
+      _formError = null;
     });
     try {
       await client.write(
@@ -508,16 +518,10 @@ final class _TodosRootPageState extends State<TodosRootPage>
           _onJournalChanged();
         },
       );
-      if (!_workOffline) {
-        await client.syncOnce();
-      }
     } catch (e) {
       if (mounted) {
         setState(() {
           _formError = '$e';
-          if (!_workOffline) {
-            _sessionStatus = SessionStatus.unreachable;
-          }
         });
       }
     } finally {
@@ -529,6 +533,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
     }
   }
 
+  /// Trash or restore after local persist; catch-up stays in the engine.
   Future<void> _setDeleted(String id, bool deleted) async {
     final client = _client;
     if (client == null || _busy) {
@@ -536,6 +541,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
     }
     setState(() {
       _busy = true;
+      _formError = null;
     });
     try {
       await client.write(
@@ -547,16 +553,10 @@ final class _TodosRootPageState extends State<TodosRootPage>
           _onJournalChanged();
         },
       );
-      if (!_workOffline) {
-        await client.syncOnce();
-      }
     } catch (e) {
       if (mounted) {
         setState(() {
           _formError = '$e';
-          if (!_workOffline) {
-            _sessionStatus = SessionStatus.unreachable;
-          }
         });
       }
     } finally {
@@ -572,7 +572,8 @@ final class _TodosRootPageState extends State<TodosRootPage>
   ///
   /// A loop of [UlsyncClient.write] would let live sync POST the first rows
   /// while the rest are still dirty; the library batch API exists for this
-  /// product action (round-2 I6).
+  /// product action (round-2 I6). Catch-up after the batch is the engine's job
+  /// while live runs; this widget does not run a manual push/pull round.
   Future<void> _moveDoneToTrash() async {
     final client = _client;
     if (client == null || _busy) {
@@ -584,6 +585,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
     }
     setState(() {
       _busy = true;
+      _formError = null;
     });
     try {
       await client.writeAll([
@@ -598,16 +600,10 @@ final class _TodosRootPageState extends State<TodosRootPage>
             },
           ),
       ]);
-      if (!_workOffline) {
-        await client.syncOnce();
-      }
     } catch (e) {
       if (mounted) {
         setState(() {
           _formError = '$e';
-          if (!_workOffline) {
-            _sessionStatus = SessionStatus.unreachable;
-          }
         });
       }
     } finally {
