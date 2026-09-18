@@ -1,8 +1,8 @@
 # ulsync example — self-hosted to-do list
 
 **Created:** 2026-09-17 17:05:37 +0300  
-**Updated:** 2026-09-18 13:21:00 +0300  
-**Version:** 3  
+**Updated:** 2026-09-18 17:58:19 +0300  
+**Version:** 5  
 **Document type:** readme
 
 ## What this is
@@ -18,7 +18,9 @@ that never cuts that kit at the SPEC ceiling of 500.
 Each window is a separate process with its own **device name** (`phone`,
 `tablet`). The library opens a separate metadata instance per name; the app
 does not resolve a filesystem path. The session strip shows **Live ·
-host:port** or **Offline · saved on this device** — never the bearer token.
+host:port**, **Reconnecting · host:port** when the store is down, or
+**Offline · saved on this device** only when you chose **Work offline** —
+never the bearer token.
 
 ## There is no cloud alice
 
@@ -86,6 +88,10 @@ echo "$TOKEN"
 prefill fields (MDM-style); labels are still **Server address** / **Access
 key**, not Base URL / Token / Connect.
 
+After sign-in the client calls `syncOnce` once, then `live()`. Local edits use
+`write` / `writeAll` only — the engine drains dirty while the feed runs. Do
+not call `syncOnce` after each add, checkbox, or trash action.
+
 ## Clean slate before a two-window run
 
 Quit all `ulsync_example.app` windows (**Cmd+Q**), then:
@@ -118,13 +124,28 @@ Both should show `Live · 127.0.0.1:8080` (or briefly `Connecting · …`).
 ## Work offline
 
 The cloud icon in the app bar (**Work offline**) mutes **this window only**.
-It is not airplane mode. The engine has no pause: cancelling the live
-*subscription* does not stop ingest. This sample **closes** the client and
-calls `UlsyncClient.open` again with the **same device name** **without**
-`live()`, so local `write` / `writeAll` still queue. Going online again is
-`syncOnce` (push dirty, then pull) plus `live()`. Do not `syncOnce` on the
-way *into* offline — that would pull the remote edits the mute is meant to
-hold back.
+It is not airplane mode and not a downed store. The engine has no pause:
+cancelling the live *subscription* does not stop ingest. This sample
+**closes** the client and calls `UlsyncClient.open` again with the **same
+device name** **without** `live()`, so local `write` / `writeAll` still queue.
+Going online again is `syncOnce` (push dirty, then pull) plus `live()`. Do not
+`syncOnce` on the way *into* offline — that would pull the remote edits the
+mute is meant to hold back.
+
+While Work offline is on, the strip shows **Offline · saved on this device**.
+That text must not appear when the store is merely unreachable.
+
+## Store unreachable
+
+Both windows stay signed in. **Stop the `ulsync-server` process** you started
+for this stand — do not use macOS airplane mode. Localhost often stays up in
+airplane mode, so that is not this scenario.
+
+With the feed still running and Work offline **off**, edits stay on this
+device and the strip shows **Reconnecting · host:port**, not Offline. Start the
+same server binary on the **same port** with the **same store database**; both
+windows converge without Cmd+Q, without the cloud, and without a Retry
+button. The engine catch-up you proved in step 34 does the work.
 
 ## Trash and batch
 
@@ -135,12 +156,58 @@ hold back.
 - **Move done to trash** sends every done, visible row in one `writeAll` — not
   a loop of `write`.
 
-## Manual acceptance (I1–I7)
+## Manual acceptance (K1–K6)
 
-Use server `http://127.0.0.1:8080`, device names `phone` and `tablet`, JWT from
-`/tmp/mint_dev_jwt.go` with secret `local-dev-only`. Each scenario needs its
-own mint, YAML, server process, build, and client DB wipe. Details for operators
-live in the step-31 TEMP handoff in the triad HQ repo.
+Round 3 on **this example** means the hands checks in the step-35 TEMP
+handoff. Use server `http://127.0.0.1:8080`, device names `phone` and
+`tablet`, JWT from `/tmp/mint_dev_jwt.go` with secret `local-dev-only`. Stop
+and restart the **server process** for outage — not airplane mode.
+
+### What the list UI can do
+
+Each row shows a **read-only** title, a **Done** checkbox, and **Trash**.
+**New to-do** + **Add** always creates a **new** id. There is **no control to
+rename** an existing row. You cannot change `Eggs` to `Free-range eggs` on the
+same line after it was added.
+
+That is enough for K1, K2, K5 (add while muted), and K6. It is **not** enough
+to drive K3 or K4 on two macOS windows as written in the triad plan.
+
+| Code | Runnable on two example windows? | Why |
+|------|----------------------------------|-----|
+| K1 | Yes | Add Milk / Bread (new rows) |
+| K2 | Yes | Done + **Move done to trash** |
+| K3 | **No** | Needs offline **title** edit on the same id; UI has no rename |
+| K4 | **No** | Needs two offline **title** edits to one id; UI has no rename |
+| K5 | Yes | Mute + **add** a row (or toggle done / trash — not rename) |
+| K6 | Yes | Read the strip while the server is stopped |
+
+**K3 and K4 on example:** mark **N/A (no title edit UI)** in your handoff
+notes. The round-3 contract for those cases is proven in
+`test/engine/offline_queue_test.dart` on step 34 (see TEMP **Hands** for test
+names). Adding inline title edit to the example is **out of scope** for step
+35.
+
+| Code | Where (when runnable) | Success | Failure |
+|------|------------------------|---------|---------|
+| K1 | Stop server. Phone: Milk. Tablet: Bread. Start server | Both lists show Milk and Bread without Cmd+Q and without the cloud | Need a window restart, the cloud, or a button |
+| K2 | Server down. Phone: mark several done, **Move done to trash**. Start server | On both windows done items are in trash completely | Half the rows or only one screen |
+| K3 | *Not on example UI* — engine tests instead | — | — |
+| K4 | *Not on example UI* — engine tests instead | — | — |
+| K5 | Phone: cloud **Work offline**, add a row, **Online** | After Online both converge; phone list is not wiped | Journal lost, mute pushed, or restart needed |
+| K6 | Server down, cloud **not** touched | Strip `Reconnecting · …`, not `Offline · saved on this device`. After start → `Live` | Outage looks like mute |
+
+K4 (last-write-wins on one field) is the honest product price when two
+devices edit the same cell offline, not a bug — but you only prove it via
+engine tests until the example grows a rename control.
+
+After K1–K6, if the stand is still live: add one item on phone — it should
+appear on tablet without stopping the server (live exchange regression).
+
+## Regression (I1–I7, J1–J4)
+
+Round 2/2a scenarios still hold. I1–I4, I6, J1–J2, J4 — as before. I5, I7,
+and J3 match K5 (Work offline mute). Green `flutter test` alone is not K1–K6.
 
 | ID | What you prove |
 |----|----------------|
@@ -148,12 +215,9 @@ live in the step-31 TEMP handoff in the triad HQ repo.
 | I2 | Done checkbox and edited time sync |
 | I3 | Trash hides from list, visible in Trash on both |
 | I4 | Restore keeps Done |
-| I5 | Offline done + online trash → both deleted and done |
+| I5 | Offline done + online trash → both deleted and done (= K5) |
 | I6 | Move done to trash batch on both windows |
-| I7 | Work offline queues edits; both windows converge after online |
-
-Round 2 closes only after a human runs all seven on two windows. Green
-`flutter test` alone is not enough.
+| I7 | Work offline queues edits; both windows converge after online (= K5) |
 
 ## Android emulator
 
