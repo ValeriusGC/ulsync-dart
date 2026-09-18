@@ -11,9 +11,6 @@ analyzer:
     todo: warning
   exclude:
     - build/**
-    # Nested app; CI analyzes it from example/. It still constructs
-    # UlsyncClient with a public store until it migrates to open(name:).
-    - example/**
 
 linter:
   rules:

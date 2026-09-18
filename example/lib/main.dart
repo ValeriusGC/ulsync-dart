@@ -1,16 +1,15 @@
 /// Self-hosted to-do list demo for the ulsync client library.
 ///
-/// Pair once per process with a distinct device name so each macOS window keeps
-/// its own metadata file. Server address and access key may be prefilled from
-/// `--dart-define`; pairing still walks health and whoami before [UlsyncClient]
-/// opens.
+/// Each to-do is an **indivisible, complete** kit: `full` (title), `done`,
+/// and `deleted`. Pair once per process with a distinct device name so
+/// each macOS window keeps its own metadata file. Server address and
+/// access key may be prefilled from `--dart-define`; pairing still walks
+/// health and whoami before [UlsyncClient] opens.
 library;
 
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:ulsync/ulsync.dart';
 import 'package:ulsync_example/server_probe.dart';
 import 'package:ulsync_example/session_status.dart';
@@ -54,7 +53,14 @@ final class TodosRootPage extends StatefulWidget {
 
 enum _PairingStep { serverAddress, signIn, signedIn }
 
-final class _TodosRootPageState extends State<TodosRootPage> {
+/// Pairing and signed-in UI. Forwards process wake to the engine.
+///
+/// [UlsyncClient] cannot import Flutter. This state is the
+/// `WidgetsBindingObserver` that calls [UlsyncClient.notifyResumed] on
+/// `AppLifecycleState.resumed` so a half-open live socket is dropped
+/// immediately after sleep.
+final class _TodosRootPageState extends State<TodosRootPage>
+    with WidgetsBindingObserver {
   static const _defaultServer = String.fromEnvironment(
     'ULSYNC_BASE_URL',
     defaultValue: kDefaultBaseUrl,
@@ -80,7 +86,6 @@ final class _TodosRootPageState extends State<TodosRootPage> {
   String _accessKey = '';
   String _userId = '';
   String _deviceName = '';
-  String _databasePath = '';
 
   UlsyncClient? _client;
   StreamSubscription<SyncEvent>? _liveSub;
@@ -95,7 +100,16 @@ final class _TodosRootPageState extends State<TodosRootPage> {
   int _todoSequence = 0;
 
   @override
+  void initState() {
+    super.initState();
+    // The engine cannot import Flutter. This is the one kick: process
+    // woke, drop the half-open live socket and catch up.
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_liveSub?.cancel());
     unawaited(_client?.close());
     _serverController.dispose();
@@ -103,6 +117,24 @@ final class _TodosRootPageState extends State<TodosRootPage> {
     _deviceNameController.dispose();
     _newTodoController.dispose();
     super.dispose();
+  }
+
+  /// Forwards a process wake to [UlsyncClient.notifyResumed].
+  ///
+  /// Lock screen, app switcher, and laptop sleep freeze the isolate.
+  /// Live reconnect and the 45s silence watchdog do not run until Dart
+  /// timers fire again. The engine owns catch-up after that call; this
+  /// widget does not call [UlsyncClient.syncOnce] here.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      return;
+    }
+    final client = _client;
+    if (client == null) {
+      return;
+    }
+    unawaited(client.notifyResumed());
   }
 
   void _onJournalChanged() {
@@ -169,19 +201,23 @@ final class _TodosRootPageState extends State<TodosRootPage> {
     }
   }
 
+  /// Opens sync for [_deviceName] after pairing.
+  ///
+  /// The device name is both the library [UlsyncClient.open] instance label
+  /// and [sourceId] for this window. The library picks IndexedDB on the web
+  /// and Application Support on IO; the widget never holds a path.
   Future<UlsyncClient> _createClient() async {
     final base = _baseUrl;
-    if (base == null || _databasePath.isEmpty) {
+    if (base == null || _deviceName.isEmpty || _userId.isEmpty) {
       throw StateError('pairing context missing');
     }
-    final store = await SembastMetadataStore.open(databasePath: _databasePath);
-    return UlsyncClient(
+    return UlsyncClient.open(
+      name: _deviceName,
       baseUrl: base,
       origin: kUlsyncOrigin,
       userScope: _userId,
       sourceId: _deviceName,
       tokenProvider: () async => _accessKey,
-      store: store,
       adapters: [
         buildTodoAdapter(journal: _journal, onChanged: _onJournalChanged),
       ],
@@ -197,12 +233,14 @@ final class _TodosRootPageState extends State<TodosRootPage> {
   /// in the journal while the strip said Offline, and I5 would be untestable.
   /// There is no `pauseLive` on the engine in this step.
   ///
-  /// Close + reopen of the **same** metadata file is the mute that still
-  /// allows [UlsyncClient.write] / [UlsyncClient.writeAll] (I6, I8). The
-  /// in-memory [TodoJournal] is not cleared. [syncOnce] must **not** run
-  /// on the offline instance: that would pull the remote trash we just
-  /// muted. Catch-up is only [startLive], which pushes dirty first, then
-  /// pulls (I5: local `done` and remote `deleted` meet after Online).
+  /// Close + [UlsyncClient.open] with the **same** [name] is the mute that
+  /// still allows [UlsyncClient.write] / [UlsyncClient.writeAll] (I6, I8).
+  /// Caching a filesystem path would put IO details back in the widget and
+  /// break the web, where [name] is an IndexedDB key. The in-memory
+  /// [TodoJournal] is not cleared. [syncOnce] must **not** run on the
+  /// offline instance: that would pull the remote trash we just muted.
+  /// Catch-up is only [startLive], which pushes dirty first, then pulls (I5:
+  /// local `done` and remote `deleted` meet after Online).
   ///
   /// If [syncOnce] fails after close, this keeps the new client **without**
   /// live so later writes do not hit `UlsyncClient is closed`.
@@ -255,11 +293,6 @@ final class _TodosRootPageState extends State<TodosRootPage> {
     UlsyncClient? client;
     try {
       final who = await fetchWhoAmI(baseUrl: base, accessKey: key);
-      final databasePath = kIsWeb
-          ? 'ulsync_example_$safeDevice.db'
-          : '${(await getApplicationDocumentsDirectory()).path}/'
-                'ulsync_example_$safeDevice.db';
-      _databasePath = databasePath;
       _accessKey = key;
       _deviceName = safeDevice;
       _userId = who.userId;
@@ -909,9 +942,7 @@ final class _TodosRootPageState extends State<TodosRootPage> {
                                 )
                               : null,
                         ),
-                        subtitle: Text(
-                          formatEditedAtLocal(todo.lastEditedAtMs),
-                        ),
+                        subtitle: Text(formatTodoSubtitle(todo)),
                         trailing: TextButton(
                           onPressed: _busy
                               ? null
@@ -960,7 +991,7 @@ final class _TodoRow extends StatelessWidget {
               )
             : null,
       ),
-      subtitle: Text(formatEditedAtLocal(todo.lastEditedAtMs)),
+      subtitle: Text(formatTodoSubtitle(todo)),
       trailing: IconButton(
         tooltip: 'Trash',
         onPressed: busy ? null : onTrash,
