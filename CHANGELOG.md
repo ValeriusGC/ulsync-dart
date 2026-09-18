@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 13:21:00 +0300  
-**Version:** 20  
+**Updated:** 2026-09-18 15:28:05 +0300  
+**Version:** 21  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- With `live()` running, `write` / `writeAll` / `markChanged` schedule
+  engine catch-up themselves. The edit future completes after persist: it
+  does not wait for HTTP and does not throw `UlsyncNetworkException`.
+  Push and pull no longer hold the serial lock, so a second `write` is
+  not blocked on `kPushPullTimeout`. Dirty after `200` clears only when
+  the stored `(id, part, revision)` still matches the posted snapshot —
+  an edit of the same cell during that POST is not dropped. Two offline
+  edits of one cell still last-write-wins, as in the product. `syncOnce`
+  remains for first sign-in, mute-exit, and tests; it is not the outage
+  retry the application must remember while the feed is live.
 - **Breaking.** [EntityAdapter.apply] and [applyPart] receive
   [IncomingEnvelopeMeta] with wire `created_at_ms` and `last_edited_at_ms`
   so applications can sort and display consistently after sync.

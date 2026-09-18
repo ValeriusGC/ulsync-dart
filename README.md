@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 13:21:00 +0300  
-**Version:** 17  
+**Updated:** 2026-09-18 15:28:05 +0300  
+**Version:** 18  
 **Document type:** readme
 
 ## What this is
@@ -105,9 +105,11 @@ await client.write(
   id: opId,
   persist: () => localOpLog.append(op),
 );
-final result = await client.syncOnce();
+// First sign-in and leaving mute: await client.syncOnce(); then live().
+// With live running, do not call syncOnce after each edit.
 final subscription = client.live().listen((event) {
   // Update the screen from SyncEvent. Do not parse envelopes.
+  // Do not call syncOnce from SyncConnectionLost / Restored.
 });
 // Flutter cannot be imported from lib/. On AppLifecycleState.resumed:
 // await client.notifyResumed();
@@ -324,10 +326,44 @@ for applications that cannot persist through the library. Calling it
 the future is left unawaited, or the call is skipped. Prefer `write`.
 The engine, not the application, increments `revision`.
 
-Then call `syncOnce` when the application decides it is a good time
-(foreground, not low battery). The library does **not** start a timer.
-The first `syncOnce` of each client names `origin` to the server, then
-runs the self-check.
+The `write` / `writeAll` future returns after persist. It does not wait
+for push or pull and does not throw `UlsyncNetworkException`: the dirty
+mark is already stored. If `live()` has been started, the engine
+schedules catch-up; the application does not call `syncOnce` after each
+edit. If `live()` has not been started, that is Work-offline mute: push
+is not invoked. `syncOnce` remains for first sign-in, leaving mute, and
+tests. The first `syncOnce` of each client names `origin` to the server,
+then runs the self-check.
+
+## Offline
+
+Two stories. They are not the same, and the application does not install
+`connectivity_plus` to tell them apart. “The Wi‑Fi icon is on” is not
+“the store answers”. A lab outage is the **ulsync-server process
+stopped**, not the OS airplane switch: airplane mode on a machine that
+talks to `127.0.0.1` does not cut localhost, and it would also cut
+everything that is not the store.
+
+**Live running, store down.** Keep calling `write` / `writeAll`. The
+strip listens to `SyncConnectionLost` / `SyncConnectionRestored`. Do
+not call `syncOnce` from those events — the engine already catch-up
+retries until push/pull succeed or a 4xx stops the loop. Do not call
+`syncOnce` after each edit. Input must not wait on the 30-second
+push/pull timeout: HTTP does not hold the serial lock. When the store
+answers again, queued dirty drains without a Retry button.
+
+**Work offline mute.** The person asked **this window** not to talk.
+`close` the client and `open` again with the same `name` **without**
+`live()`. Do not call `syncOnce` on the way **into** mute (that would
+pull what mute is meant to hold back). Leaving mute is `syncOnce` then
+`live()`. Neighbour windows may stay Live. Mute is not a store outage
+and is not OS airplane mode.
+
+`notifyResumed` is still required when the **process** wakes
+(`AppLifecycleState.resumed`). `lib/` does not import Flutter, so the
+engine cannot see isolate sleep; a half-open socket can look healthy
+until the application reports a wake. That kick is not a network
+detector.
 
 ## Named parts
 
@@ -468,7 +504,8 @@ What to call:
 | Handshake with the store | nothing — `GET /v1/sync/hello` runs before the first `syncOnce` exchange and before `live` opens |
 | Persist a local edit | `write` (one row) or `writeAll` (one related action) |
 | Persist without the library callback | `markChanged` — low-level; prefer `write` |
-| Exchange with the server | `syncOnce` |
+| First sign-in or leaving mute | `syncOnce`, then `live()` |
+| Exchange while live is running | nothing — the engine drains after `write`; do not call `syncOnce` after each edit |
 | Find and repair divergence | nothing — `selfCheck` runs on the first `syncOnce`. Call it only for a manual diagnostic. |
 
 There are no public `reconcile` or `verify` methods. One action, one
@@ -498,19 +535,24 @@ in the library metadata file the `name` argument selects.
   older server whose limit is still 1 answers HTTP 413 for a longer
   batch. The library does not turn that into per-envelope POSTs.
 - Dirty marks for a posted batch are cleared only after that POST
-  returns. A thrown transport error leaves every posted mark set.
+  returns, and only when the stored `(id, part, revision)` still matches
+  the posted snapshot. A thrown transport error leaves every posted mark
+  set. A newer local revision written while that POST was in flight stays
+  dirty.
 - There is no tombstone type. Hiding a record is an application part
   the library does not interpret. `flags` stay `0`.
 - No payload compression, no clock-skew correction, no content schema
   migrations inside the library.
 - The library does not call `syncOnce` on a timer for battery. After
-  `live()` starts, drop, 5xx, and TCP death are retried by the engine
-  until `close()`. A frozen isolate (app switcher, laptop sleep) is
-  **not** visible inside `lib/` (Flutter import is forbidden). Call
-  `UlsyncClient.notifyResumed` from `AppLifecycleState.resumed`.
+  `live()` starts, a local `write` schedules catch-up, and drop, 5xx,
+  and TCP death are retried by the engine until `close()`. A frozen
+  isolate (app switcher, laptop sleep) is **not** visible inside `lib/`
+  (Flutter import is forbidden). Call `UlsyncClient.notifyResumed` from
+  `AppLifecycleState.resumed`. That is isolate wake, not a network
+  detector.
 - `syncOnce` itself does not retry HTTP `5xx` or network errors: it
-  throws and leaves `dirty` set. `notifyResumed` and live restore wrap
-  it in a retry loop.
+  throws and leaves `dirty` set. Catch-up after `write` (when live is
+  running), `notifyResumed`, and live restore wrap it in a retry loop.
 - `applied: false` is success: the server already holds a row that is
   not inferior. The engine clears `dirty` on both `true` and `false`.
   Retrying a rejected envelope loops forever because the upsert requires
