@@ -1,20 +1,49 @@
+/// Example journal: `full`, `done`, and `deleted` are one **complete** kit.
+library;
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:ulsync/ulsync.dart';
 import 'package:ulsync_example/session_status.dart';
 import 'package:ulsync_example/todo.dart';
 
+IncomingEnvelopeMeta _meta({int edited = 5_000, int created = 4_000}) {
+  return IncomingEnvelopeMeta(
+    part: kTodoPartDone,
+    createdAtMs: created,
+    lastEditedAtMs: edited,
+    revision: 2,
+    sourceId: 'tablet',
+  );
+}
+
 void main() {
   group('TodoJournal column apply', () {
-    test('applyFullTitle does not reset done and deleted', () {
+    test('applyIncomingFull does not reset done and deleted', () {
       final journal = TodoJournal();
       journal.setTitle('a', 'Milk');
       journal.setDone('a', true);
       journal.setDeleted('a', true);
 
-      journal.applyFullTitle('a', 'Milk');
+      journal.applyIncomingFull('a', 'Milk', _meta());
 
       final row = journal.byId('a')!;
       expect(row.done, isTrue);
       expect(row.deleted, isTrue);
+    });
+
+    test('applyIncomingFull uses wire edit time for sort', () {
+      final journal = TodoJournal();
+      journal.setTitle('a', 'Old');
+      journal.applyIncomingFull(
+        'a',
+        'New',
+        _meta(edited: 9_000, created: 8_000),
+      );
+
+      final row = journal.byId('a')!;
+      expect(row.lastEditedAtMs, 9_000);
+      expect(row.createdAtMs, 8_000);
+      expect(row.receivedAtMs, isNotNull);
     });
 
     test('listIds after setDeleted still contains the id', () {
@@ -70,6 +99,31 @@ void main() {
       journal.setDeleted('b', true);
 
       expect(journal.doneNotTrashedIds(), ['a']);
+    });
+  });
+
+  group('formatTodoSubtitle', () {
+    test('omits received when local edit only', () {
+      final todo = Todo(
+        id: 'a',
+        createdAtMs: 1,
+        lastEditedAtMs: 1_700_000_000_000,
+      );
+      expect(formatTodoSubtitle(todo), formatEditedAtLocal(1_700_000_000_000));
+    });
+
+    test('shows received in parentheses after sync apply', () {
+      final todo = Todo(
+        id: 'a',
+        createdAtMs: 1,
+        lastEditedAtMs: 1_700_000_000_000,
+        receivedAtMs: 1_700_000_060_000,
+      );
+      expect(
+        formatTodoSubtitle(todo),
+        '${formatEditedAtLocal(1_700_000_000_000)} '
+        '(received ${formatEditedAtLocal(1_700_000_060_000)})',
+      );
     });
   });
 

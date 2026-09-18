@@ -1,10 +1,13 @@
 /// Pure to-do domain for the ulsync example (no Flutter imports).
 ///
-/// Rows live in a map keyed by wire id. Trash is [Todo.deleted] == true, not
-/// absence: [TodoJournal.listIds] must still name trashed ids, or the library
-/// will treat a hidden row as missing and start repairing a loss that did not
-/// happen. [Todo.done] and [Todo.deleted] are independent; restoring from
-/// trash must not clear the checkbox.
+/// The complete row is the union of `full` (title), `done`, and `deleted` —
+/// an **indivisible, complete** kit of three equal cells, not a snapshot
+/// plus optional flags. Rows live in a map keyed by wire id. Trash is
+/// [Todo.deleted] == true, not absence: [TodoJournal.listIds] must still
+/// name trashed ids, or the library will treat a hidden row as missing and
+/// start repairing a loss that did not happen. [Todo.done] and
+/// [Todo.deleted] are independent; restoring from trash must not clear the
+/// checkbox.
 library;
 
 import 'dart:convert';
@@ -21,13 +24,15 @@ const String kTodoEntityType = 'todo';
 
 /// Part name for the done checkbox column in this example.
 ///
-/// Literal chosen by the sample app, not a protocol reserved name. The
-/// library forwards the string; only [EntityAdapter.applyPart] interprets it.
+/// One cell of the to-do's **indivisible, complete** kit, equal to `full`
+/// and [kTodoPartDeleted]. Literal chosen by the sample app, not a
+/// protocol reserved name.
 const String kTodoPartDone = 'done';
 
 /// Part name for the trash column in this example.
 ///
-/// Hiding a row is a normal part envelope, not a tombstone bit in [Envelope.flags].
+/// One cell of the to-do's **indivisible, complete** kit. Hiding a row is
+/// a normal part envelope, not a tombstone bit in [Envelope.flags].
 const String kTodoPartDeleted = 'deleted';
 
 /// One to-do row in the example journal.
@@ -38,14 +43,16 @@ const String kTodoPartDeleted = 'deleted';
 /// happen. [done] and [deleted] are independent; restoring from trash must not
 /// clear the checkbox.
 final class Todo {
-  /// Creates a row. [lastEditedAtMs] defaults to now when omitted.
+  /// Creates a row.
   Todo({
     required this.id,
     this.title = '',
     this.done = false,
     this.deleted = false,
-    int? lastEditedAtMs,
-  }) : lastEditedAtMs = lastEditedAtMs ?? DateTime.now().millisecondsSinceEpoch;
+    required this.createdAtMs,
+    required this.lastEditedAtMs,
+    this.receivedAtMs,
+  });
 
   /// Stable wire id; must match the envelope key.
   final String id;
@@ -59,12 +66,19 @@ final class Todo {
   /// Trash column. Only part [kTodoPartDeleted] writes this field.
   bool deleted;
 
-  /// Latest edit time across title, done, and trash actions on this device.
+  /// Creation time from the wire (SPEC `created_at_ms`).
+  int createdAtMs;
+
+  /// Last edit time from the wire (SPEC `last_edited_at_ms`).
   ///
-  /// Shown in the list and bumped by [TodoJournal.setTitle], [setDone], and
-  /// [setDeleted] so a checkbox click moves the timestamp even when the text
-  /// did not change.
+  /// Local writes set this to the same clock the engine uses for metadata.
+  /// Incoming applies copy [IncomingEnvelopeMeta.lastEditedAtMs] so sort
+  /// order matches on every device.
   int lastEditedAtMs;
+
+  /// When this installation applied the latest wire edit, if different from
+  /// [lastEditedAtMs]. Shown in parentheses in the list subtitle.
+  int? receivedAtMs;
 }
 
 /// In-memory journal keyed by wire id.
@@ -81,14 +95,14 @@ final class TodoJournal {
   /// Every stored id, including rows with [Todo.deleted] == true.
   List<String> listIds() => _byId.keys.toList(growable: false);
 
-  /// Active list rows: not in trash, in stable id order for the UI.
+  /// Active list rows: not in trash, newest wire edit first.
   List<Todo> activeTodos() {
     final rows = _byId.values.where((t) => !t.deleted).toList(growable: false)
       ..sort((a, b) => b.lastEditedAtMs.compareTo(a.lastEditedAtMs));
     return rows;
   }
 
-  /// Trash screen rows, newest edit first.
+  /// Trash screen rows, newest wire edit first.
   List<Todo> trashedTodos() {
     final rows = _byId.values.where((t) => t.deleted).toList(growable: false)
       ..sort((a, b) => b.lastEditedAtMs.compareTo(a.lastEditedAtMs));
@@ -104,7 +118,7 @@ final class TodoJournal {
   /// Returns the row for [id], or `null` when this installation never saw it.
   Todo? byId(String id) => _byId[id];
 
-  /// Inserts or replaces title text and bumps [Todo.lastEditedAtMs].
+  /// Inserts or replaces title text and bumps wire edit time.
   ///
   /// Creates the row when [id] is new. Does not reset [Todo.done] or
   /// [Todo.deleted]; a full snapshot from the wire must behave the same way
@@ -113,43 +127,116 @@ final class TodoJournal {
     final now = DateTime.now().millisecondsSinceEpoch;
     final existing = _byId[id];
     if (existing == null) {
-      _byId[id] = Todo(id: id, title: title, lastEditedAtMs: now);
+      _byId[id] = Todo(
+        id: id,
+        title: title,
+        createdAtMs: now,
+        lastEditedAtMs: now,
+      );
       return;
     }
     existing.title = title;
     existing.lastEditedAtMs = now;
+    existing.receivedAtMs = null;
   }
 
   /// Applies only the title from an incoming full snapshot.
   ///
-  /// Slice fields in the decoded object are ignored so a remote `full` payload
-  /// cannot clear [Todo.done] or restore a trashed row by accident.
-  void applyFullTitle(String id, String title) {
+  /// `full` is one cell of an **indivisible, complete** kit. Slice fields
+  /// in the decoded object are ignored so a remote `full` payload cannot
+  /// clear [Todo.done] or restore a trashed row by accident. Wire ranks
+  /// come from [meta], not local wall clock.
+  void applyIncomingFull(String id, String title, IncomingEnvelopeMeta meta) {
+    final received = DateTime.now().millisecondsSinceEpoch;
     final existing = _byId[id];
     if (existing == null) {
-      _byId[id] = Todo(id: id, title: title);
+      _byId[id] = Todo(
+        id: id,
+        title: title,
+        createdAtMs: meta.createdAtMs,
+        lastEditedAtMs: meta.lastEditedAtMs,
+        receivedAtMs: received,
+      );
       return;
     }
     if (existing.title != title) {
       existing.title = title;
-      existing.lastEditedAtMs = DateTime.now().millisecondsSinceEpoch;
     }
+    existing.createdAtMs = meta.createdAtMs;
+    existing.lastEditedAtMs = meta.lastEditedAtMs;
+    existing.receivedAtMs = received;
   }
 
-  /// Writes the done checkbox and bumps [Todo.lastEditedAtMs].
+  /// Writes the done checkbox for a local edit.
   void setDone(String id, bool done) {
-    final row = _byId.putIfAbsent(id, () => Todo(id: id));
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final row = _byId.putIfAbsent(
+      id,
+      () => Todo(id: id, createdAtMs: now, lastEditedAtMs: now),
+    );
     row.done = done;
-    row.lastEditedAtMs = DateTime.now().millisecondsSinceEpoch;
+    row.lastEditedAtMs = now;
+    row.receivedAtMs = null;
   }
 
-  /// Writes the trash flag and bumps [Todo.lastEditedAtMs].
+  /// Applies a remote `done` part using wire edit ranks.
+  ///
+  /// Equal in rank to `full` and [kTodoPartDeleted]: one cell of a
+  /// **complete** kit. May create the row if `full` has not arrived yet.
+  void applyIncomingDone(String id, bool done, IncomingEnvelopeMeta meta) {
+    final received = DateTime.now().millisecondsSinceEpoch;
+    final row = _byId.putIfAbsent(
+      id,
+      () => Todo(
+        id: id,
+        createdAtMs: meta.createdAtMs,
+        lastEditedAtMs: meta.lastEditedAtMs,
+        receivedAtMs: received,
+      ),
+    );
+    row.done = done;
+    row.createdAtMs = meta.createdAtMs;
+    row.lastEditedAtMs = meta.lastEditedAtMs;
+    row.receivedAtMs = received;
+  }
+
+  /// Writes the trash flag for a local edit.
   ///
   /// Does not clear [Todo.done]; a trashed row may stay done (I5).
   void setDeleted(String id, bool deleted) {
-    final row = _byId.putIfAbsent(id, () => Todo(id: id));
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final row = _byId.putIfAbsent(
+      id,
+      () => Todo(id: id, createdAtMs: now, lastEditedAtMs: now),
+    );
     row.deleted = deleted;
-    row.lastEditedAtMs = DateTime.now().millisecondsSinceEpoch;
+    row.lastEditedAtMs = now;
+    row.receivedAtMs = null;
+  }
+
+  /// Applies a remote `deleted` part using wire edit ranks.
+  ///
+  /// Equal in rank to `full` and [kTodoPartDone]: one cell of a
+  /// **complete** kit. May create the row if `full` has not arrived yet.
+  void applyIncomingDeleted(
+    String id,
+    bool deleted,
+    IncomingEnvelopeMeta meta,
+  ) {
+    final received = DateTime.now().millisecondsSinceEpoch;
+    final row = _byId.putIfAbsent(
+      id,
+      () => Todo(
+        id: id,
+        createdAtMs: meta.createdAtMs,
+        lastEditedAtMs: meta.lastEditedAtMs,
+        receivedAtMs: received,
+      ),
+    );
+    row.deleted = deleted;
+    row.createdAtMs = meta.createdAtMs;
+    row.lastEditedAtMs = meta.lastEditedAtMs;
+    row.receivedAtMs = received;
   }
 
   /// Removes every stored row (for example on sign-out).
@@ -175,11 +262,16 @@ EntityAdapter<Todo> buildTodoAdapter({
     decode: (bytes, schemaVersion) {
       final decoded = jsonDecode(utf8.decode(bytes));
       final map = Map<String, Object?>.from(decoded as Map);
-      return Todo(id: map['id']! as String, title: map['title']! as String);
+      return Todo(
+        id: map['id']! as String,
+        title: map['title']! as String,
+        createdAtMs: 0,
+        lastEditedAtMs: 0,
+      );
     },
     load: (id) async => journal.byId(id),
-    apply: (todo) async {
-      journal.applyFullTitle(todo.id, todo.title);
+    apply: (todo, meta) async {
+      journal.applyIncomingFull(todo.id, todo.title, meta);
       onChanged();
     },
     encodePart: (id, part) async {
@@ -193,12 +285,12 @@ EntityAdapter<Todo> buildTodoAdapter({
         _ => null,
       };
     },
-    applyPart: (id, part, payload) async {
+    applyPart: (id, part, payload, meta) async {
       switch (part) {
         case kTodoPartDone:
-          journal.setDone(id, _readFlag(payload, 'done'));
+          journal.applyIncomingDone(id, _readFlag(payload, 'done'), meta);
         case kTodoPartDeleted:
-          journal.setDeleted(id, _readFlag(payload, 'deleted'));
+          journal.applyIncomingDeleted(id, _readFlag(payload, 'deleted'), meta);
         default:
           break;
       }
@@ -266,4 +358,14 @@ String formatEditedAtLocal(int lastEditedAtMs) {
   final m = local.minute.toString().padLeft(2, '0');
   return '${local.year}-${local.month.toString().padLeft(2, '0')}-'
       '${local.day.toString().padLeft(2, '0')} $h:$m';
+}
+
+/// Primary wire edit time; optional local receive time in parentheses.
+String formatTodoSubtitle(Todo todo) {
+  final edited = formatEditedAtLocal(todo.lastEditedAtMs);
+  final received = todo.receivedAtMs;
+  if (received == null) {
+    return edited;
+  }
+  return '$edited (received ${formatEditedAtLocal(received)})';
 }

@@ -1,4 +1,7 @@
 /// Test double for [SyncTransport]. No HTTP and no `dart:io`.
+///
+/// Scripts may return a full page that ends mid-kit; the engine must hold
+/// the trailing id so the kit stays **indivisible**.
 library;
 
 import 'dart:async';
@@ -47,6 +50,9 @@ final class FakeSyncTransport implements SyncTransport {
   /// Cursor values read at [live] open and each [simulateReconnect].
   final List<int> appliedSinceReads = [];
 
+  /// Times [pokeLive] ran.
+  int pokeLiveCalls = 0;
+
   /// Whether [close] has run.
   bool closed = false;
 
@@ -87,6 +93,12 @@ final class FakeSyncTransport implements SyncTransport {
     this.onConnectionState = onConnectionState;
     appliedSinceReads.add(appliedSince());
     return liveController.stream;
+  }
+
+  @override
+  Future<void> pokeLive() async {
+    _ensureOpen();
+    pokeLiveCalls++;
   }
 
   /// Records another [appliedSince] read, as a transport reopen would.

@@ -78,7 +78,7 @@ EntityAdapter<_Memo> _adapter({
       }
       return _Memo(id: id, text: text);
     },
-    apply: (memo) async {
+    apply: (memo, meta) async {
       appStore[memo.id] = memo.text;
     },
     listIds: () async {

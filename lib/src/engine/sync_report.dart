@@ -1,5 +1,8 @@
 /// Counters from one [UlsyncClient.syncOnce] pass.
 ///
+/// [applied] counts cells of a record kit (`full` or a named part), not
+/// "rows finished". Completeness is the union of those cells.
+///
 /// Live-feed applies are not included: they have no report, only [SyncEvent].
 ///
 /// @docImport '../transport/sync_transport.dart';
@@ -40,7 +43,9 @@ final class SyncReport {
 
   /// Times a domain apply ran during this pass ([EntityAdapter.apply] for
   /// `full`, [EntityAdapter.applyPart] for other parts), not including live.
-  /// An unknown part with no `applyPart` does not increment this.
+  /// Each increment is one cell of a record kit; completeness requires
+  /// every cell, not only `full`. An unknown part with no `applyPart` does
+  /// not increment this.
   final int applied;
 
   /// Applied cursor after this pass (`server_seq` of the last persisted

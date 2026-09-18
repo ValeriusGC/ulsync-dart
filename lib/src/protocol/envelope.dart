@@ -28,6 +28,10 @@ abstract final class _EnvelopeKeys {
 
 /// A single sync envelope as defined in SPEC section 1.1.
 ///
+/// Identity is `(id, part)`. Each envelope is one cell of a record kit:
+/// `full` plus every named part of that `id` must stay **indivisible** and
+/// **complete** on the client. The codec does not drop parts.
+///
 /// Three deliberate differences from the server-side table:
 ///
 /// - No [userId]: the owner is taken from the bearer token (`sub`), not the
@@ -58,7 +62,8 @@ final class Envelope {
   /// Stable entity identifier (UUID string on the wire).
   final String id;
 
-  /// Envelope part name (round 1 always `full`).
+  /// Envelope part name. Identity is `(id, part)`. One cell of an
+  /// **indivisible, complete** kit; `full` is not the whole record.
   final String part;
 
   /// Logical entity type, for example `counter_operation`.

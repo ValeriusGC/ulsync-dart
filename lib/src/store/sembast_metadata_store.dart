@@ -1,7 +1,9 @@
 /// Per-user metadata persistence on sembast.
 ///
-/// Stores entity sync state and server feed cursors in a database file separate
-/// from the application's own storage.
+/// Stores entity sync state (one row per `(id, part)` cell of a record kit)
+/// and server feed cursors in a database file separate from the
+/// application's own storage. The engine packs those cells into
+/// **indivisible, complete** kits at push time.
 library;
 
 import 'package:sembast/sembast.dart';
@@ -159,7 +161,30 @@ final class SembastMetadataStore {
   Future<void> put(EntityState state) =>
       _entities.record(_entityKeyOf(state)).put(_db, _toMap(state));
 
+  /// Every dirty row for [userScope], oldest edit first.
+  ///
+  /// The engine packs **indivisible, complete** record kits from this list
+  /// so a push never splits `full` / `done` / `deleted` of one id. This
+  /// method does not apply the SPEC ceiling.
+  Future<List<EntityState>> allDirty(String userScope) async {
+    final found = await _entities.find(
+      _db,
+      finder: Finder(
+        filter: Filter.and([
+          Filter.equals('userScope', userScope),
+          Filter.equals('dirty', true),
+        ]),
+        sortOrders: [SortOrder('lastEditedAtMs'), SortOrder('id')],
+      ),
+    );
+    return found.map((s) => _fromMap(s.value)).toList(growable: false);
+  }
+
   /// Pending entities for [userScope], oldest edit first, at most [limit] rows.
+  ///
+  /// This is a raw window. Push packing uses [allDirty] plus complete-kit
+  /// assembly so a limit of 500 cannot cut an **indivisible** record kit
+  /// in half.
   Future<List<EntityState>> dirtyBatch({
     required String userScope,
     required int limit,

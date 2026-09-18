@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 10:13:46 +0300  
-**Version:** 19  
+**Updated:** 2026-09-18 13:21:00 +0300  
+**Version:** 20  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking.** [EntityAdapter.apply] and [applyPart] receive
+  [IncomingEnvelopeMeta] with wire `created_at_ms` and `last_edited_at_ms`
+  so applications can sort and display consistently after sync.
+- The engine reopens live on drop, retries `syncOnce` after
+  `SyncConnectionRestored` until the server answers, and exposes
+  `UlsyncClient.notifyResumed` for isolate wake (Flutter lifecycle
+  cannot be observed from `lib/`). `SyncTransport.pokeLive` drops a
+  half-open socket immediately.
+- Record kits (`full` plus every named part of one id) are **indivisible**
+  and must be **complete**. Ingest skips only a strictly older version of
+  the **same** `(id, part)`. A three-rank tie still applies. Push, pull,
+  and diff never split a kit at the SPEC ceiling of 500: a POST may be
+  shorter than 500, a full pull page holds the trailing id, and diff
+  probes of one id stay in one request. [syncOnce] replays the feed when
+  library metadata remembers any cell that [EntityAdapter.load] no longer
+  returns.
 - **Breaking.** The only public way to construct a client is
   `UlsyncClient.open(name: …)`. `name` is an installation-local label,
   not a filesystem path. The generative constructor and the metadata
@@ -34,8 +50,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `NSURLIsExcludedFromBackupKey`. This release does not set that flag.
 - The round-1 constructor compatibility test is removed. There is no
   published-package duty to keep the unpublished constructor compiling.
-- The dirty queue posts up to 500 envelopes in one `POST /v1/sync/push`
-  (`kPushBatchLimit` matches the SPEC maximum). Marks clear only after
+- The dirty queue posts complete record kits in one `POST /v1/sync/push`
+  (`kPushBatchLimit` is the SPEC maximum of 500). A kit is never split
+  to fill that ceiling. Marks clear only after
   that response, including `applied: false`. A thrown transport error
   leaves posted marks set. HTTP 413 is not retried as single-envelope
   POSTs.

@@ -1,5 +1,5 @@
-/// Column-apply tests: named parts are independent cells, not one winner
-/// per record.
+/// Column-apply tests: named parts are equal cells of one **indivisible,
+/// complete** record kit, not optional footnotes to `full`.
 ///
 /// The test domain has three columns — `title`, `done`, `deleted`.
 /// [EntityAdapter.apply] of `full` writes **only** `title`.
@@ -7,7 +7,8 @@
 /// [EntityAdapter.applyPart] for `deleted` writes only `deleted`.
 /// Incoming `full` payloads still *carry* slice fields so a naive apply
 /// that copied every JSON key would restore a hidden row; the spy and
-/// the domain assertions both fail if that happens.
+/// the domain assertions both fail if that happens. A pull page must not
+/// ingest `full` of an id while leaving `done` on the next page.
 library;
 
 import 'dart:convert';
@@ -162,8 +163,15 @@ final class _Harness {
   /// Opens a client whose `apply` of `full` writes only [_Task.title].
   static Future<_Harness> open({
     Future<Uint8List?> Function(String id, String part)? encodePart,
-    Future<void> Function(String id, String part, Uint8List payload)? applyPart,
+    Future<void> Function(
+      String id,
+      String part,
+      Uint8List payload,
+      IncomingEnvelopeMeta meta,
+    )?
+    applyPart,
     bool includePartCallbacks = true,
+    int pullPageLimit = 500,
   }) async {
     final factory = databaseFactoryMemory;
     final path = 'named_parts_${_pathCounter++}';
@@ -179,6 +187,7 @@ final class _Harness {
       String id,
       String part,
       Uint8List payload,
+      IncomingEnvelopeMeta meta,
     ) async {
       final row = domain.putIfAbsent(id, () => _Task(id: id));
       switch (part) {
@@ -212,7 +221,7 @@ final class _Harness {
           ),
           decode: (bytes, schemaVersion) => _taskFromFull(bytes),
           load: (id) async => domain[id],
-          apply: (task) async {
+          apply: (task, meta) async {
             final existing = domain[task.id];
             final beforeDeleted = existing?.deleted;
             final row = existing ?? _Task(id: task.id);
@@ -250,6 +259,7 @@ final class _Harness {
       ],
       transport: fake,
       inMemory: true,
+      pullPageLimit: pullPageLimit,
     );
     final store = await SembastMetadataStore.open(
       databasePath: path,
@@ -518,6 +528,112 @@ void main() {
     expect(report.pushed, 0);
     expect((await h.stateOf('t1', part: 'done'))!.dirty, isFalse);
   });
+
+  test(
+    'equal-rank done and deleted apply after full recreates a blank domain row',
+    () async {
+      final h = await _Harness.open();
+      const time = 5000;
+      const rev = 3;
+      const source = 'device-b';
+      h.fake.onPull = ({required int since, int? limit}) async {
+        if (since == 0) {
+          return PullPage(
+            envelopes: [
+              _partEnvelope(
+                id: 't1',
+                part: 'full',
+                serverSeq: 1,
+                payload: _fullBytes(id: 't1', title: 'Buy milk'),
+                lastEditedAtMs: time,
+                revision: rev,
+                sourceId: source,
+              ),
+              _partEnvelope(
+                id: 't1',
+                part: 'done',
+                serverSeq: 2,
+                payload: _flagBytes(true),
+                lastEditedAtMs: time,
+                revision: rev,
+                sourceId: source,
+              ),
+              _partEnvelope(
+                id: 't1',
+                part: 'deleted',
+                serverSeq: 3,
+                payload: _flagBytes(true),
+                lastEditedAtMs: time,
+                revision: rev,
+                sourceId: source,
+              ),
+            ],
+            nextCursor: 3,
+          );
+        }
+        return PullPage(envelopes: const [], nextCursor: since);
+      };
+
+      await h.client.syncOnce();
+      expect(h.domain['t1']!.title, 'Buy milk');
+      expect(h.domain['t1']!.done, isTrue);
+      expect(h.domain['t1']!.deleted, isTrue);
+
+      h.domain.clear();
+      await h.client.syncOnce();
+      expect(h.domain['t1']!.title, 'Buy milk');
+      expect(h.domain['t1']!.done, isTrue);
+      expect(h.domain['t1']!.deleted, isTrue);
+    },
+  );
+
+  test(
+    'pull holds trailing full so done on the next page is not cut off',
+    () async {
+      final h = await _Harness.open(pullPageLimit: 3);
+      final feed = [
+        _partEnvelope(
+          id: 'n1',
+          part: 'full',
+          serverSeq: 1,
+          payload: _fullBytes(id: 'n1', title: 'One'),
+        ),
+        _partEnvelope(
+          id: 'n2',
+          part: 'full',
+          serverSeq: 2,
+          payload: _fullBytes(id: 'n2', title: 'Two'),
+        ),
+        _partEnvelope(
+          id: 't1',
+          part: 'full',
+          serverSeq: 3,
+          payload: _fullBytes(id: 't1', title: 'Buy milk'),
+        ),
+        _partEnvelope(
+          id: 't1',
+          part: 'done',
+          serverSeq: 4,
+          payload: _flagBytes(true),
+        ),
+      ];
+      h.fake.onPull = ({required int since, int? limit}) async {
+        final pageLimit = limit ?? 3;
+        final remaining = feed
+            .where((envelope) => envelope.serverSeq! > since)
+            .take(pageLimit)
+            .toList(growable: false);
+        final next = remaining.isEmpty ? since : remaining.last.serverSeq!;
+        return PullPage(envelopes: remaining, nextCursor: next);
+      };
+
+      await h.client.syncOnce();
+      expect(h.fake.pullCalls[0].limit, 3);
+      expect(h.fake.pullCalls[1].since, 2);
+      expect(h.domain['t1']!.title, 'Buy milk');
+      expect(h.domain['t1']!.done, isTrue);
+    },
+  );
 
   test(
     'write with a blank part is ArgumentError and persist does not run',

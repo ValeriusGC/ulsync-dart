@@ -1,8 +1,10 @@
 /// Report from one [UlsyncClient.selfCheck] run.
 ///
-/// Each phase says whether it was available. Unavailable is a supported
-/// configuration for the **server** phase (old server, transport without
-/// the check, `includeServer: false`). It is not how a forgotten
+/// Diff probes for one `id` are packed as an **indivisible** kit so a
+/// batch of 500 never splits `full` from `done`. Each phase says whether
+/// it was available. Unavailable is a supported configuration for the
+/// **server** phase (old server, transport without the check,
+/// `includeServer: false`). It is not how a forgotten
 /// [EntityAdapter.listIds] looks: that callback is required.
 ///
 /// @docImport 'entity_adapter.dart';

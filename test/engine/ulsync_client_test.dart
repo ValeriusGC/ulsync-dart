@@ -1,4 +1,7 @@
 /// Engine tests against a fake transport and an in-memory sembast store.
+///
+/// Record kits (`full` plus named parts of one id) stay **indivisible**
+/// and **complete** across push, pull, and ingest.
 library;
 
 import 'dart:async';
@@ -104,6 +107,7 @@ final class _Harness {
     Future<void> Function()? beforePersistIncoming,
     Completer<void>? applyGate,
     void Function()? onApplyEntered,
+    Duration catchUpRetryDelay = Duration.zero,
   }) async {
     final factory = databaseFactoryMemory;
     final name = 'engine_test_${_pathCounter++}';
@@ -131,7 +135,7 @@ final class _Harness {
             }
             return _Memo(id: id, text: text);
           },
-          apply: (memo) async {
+          apply: (memo, meta) async {
             onApplyEntered?.call();
             if (applyGate != null) {
               await applyGate.future;
@@ -145,6 +149,7 @@ final class _Harness {
       transport: fake,
       inMemory: true,
       beforePersistIncoming: beforePersistIncoming,
+      catchUpRetryDelay: catchUpRetryDelay,
     );
     final store = await SembastMetadataStore.open(
       databasePath: name,
@@ -400,6 +405,14 @@ void main() {
         expectApply: false,
         expectedText: 'local',
       );
+      await runCase(
+        id: 'e-tie',
+        challengerTime: 1000,
+        challengerRev: 2,
+        challengerSource: 'device-a',
+        expectApply: true,
+        expectedText: 'challenger',
+      );
     },
   );
 
@@ -408,26 +421,28 @@ void main() {
     () async {
       final full = await _Harness.open();
       full.fake.onPull = ({required int since, int? limit}) async {
-        if (since == 0) {
-          return PullPage(
-            envelopes: [
-              for (var i = 1; i <= 100; i++)
-                _memoEnvelope(
-                  id: 'n$i',
-                  serverSeq: i,
-                  text: 't$i',
-                  lastEditedAtMs: 1000 + i,
-                  revision: 1,
-                ),
-            ],
-            nextCursor: 100,
-          );
-        }
-        return PullPage(envelopes: const [], nextCursor: 100);
+        final all = [
+          for (var i = 1; i <= 500; i++)
+            _memoEnvelope(
+              id: 'n$i',
+              serverSeq: i,
+              text: 't$i',
+              lastEditedAtMs: 1000 + i,
+              revision: 1,
+            ),
+        ];
+        final pageLimit = limit ?? 500;
+        final remaining = all
+            .where((envelope) => envelope.serverSeq! > since)
+            .take(pageLimit)
+            .toList(growable: false);
+        final next = remaining.isEmpty ? since : remaining.last.serverSeq!;
+        return PullPage(envelopes: remaining, nextCursor: next);
       };
       await full.client.syncOnce();
       expect(full.fake.pullCalls, hasLength(2));
-      expect(full.fake.pullCalls[0].limit, 100);
+      expect(full.fake.pullCalls[0].limit, 500);
+      expect(full.applies, 500);
 
       final short = await _Harness.open();
       short.fake.onPull = ({required int since, int? limit}) async {
@@ -617,6 +632,111 @@ void main() {
     expect(liveError, isNull);
     expect(h.fake.appliedSinceReads, isNotEmpty);
   });
+
+  test(
+    'SyncConnectionRestored hydrates an empty domain via syncOnce',
+    () async {
+      final h = await _Harness.open();
+      h.fake.onPull = ({required int since, int? limit}) async {
+        if (since == 0) {
+          return PullPage(
+            envelopes: [_memoEnvelope(id: 'e1', serverSeq: 4, text: 'Milk')],
+            nextCursor: 4,
+          );
+        }
+        return PullPage(envelopes: const [], nextCursor: since);
+      };
+      await h.client.syncOnce();
+      h.appStore.clear();
+      h.applyCount[0] = 0;
+
+      h.client.live().listen((_) {});
+      await _pumpUntil(() => h.fake.onConnectionState != null);
+      h.fake.onConnectionState!(LiveConnectionState.restored);
+      await _pumpUntil(() => h.applies >= 1);
+
+      expect(h.appStore['e1'], 'Milk');
+    },
+  );
+
+  test('notifyResumed pokes live and hydrates an empty domain', () async {
+    final h = await _Harness.open();
+    h.fake.onPull = ({required int since, int? limit}) async {
+      if (since == 0) {
+        return PullPage(
+          envelopes: [_memoEnvelope(id: 'e1', serverSeq: 3, text: 'Milk')],
+          nextCursor: 3,
+        );
+      }
+      return PullPage(envelopes: const [], nextCursor: since);
+    };
+    await h.client.syncOnce();
+    h.appStore.clear();
+    h.applyCount[0] = 0;
+    h.client.live().listen((_) {});
+    await _pumpUntil(() => h.fake.appliedSince != null);
+
+    await h.client.notifyResumed();
+
+    expect(h.fake.pokeLiveCalls, 1);
+    expect(h.appStore['e1'], 'Milk');
+  });
+
+  test('notifyResumed retries syncOnce after a network miss', () async {
+    final h = await _Harness.open();
+    var pulls = 0;
+    h.fake.onPull = ({required int since, int? limit}) async {
+      pulls++;
+      if (pulls == 1) {
+        throw const UlsyncNetworkException('server down');
+      }
+      if (since == 0) {
+        return PullPage(
+          envelopes: [_memoEnvelope(id: 'e1', serverSeq: 2, text: 'Milk')],
+          nextCursor: 2,
+        );
+      }
+      return PullPage(envelopes: const [], nextCursor: since);
+    };
+
+    await h.client.notifyResumed();
+
+    expect(h.fake.pokeLiveCalls, 1);
+    expect(h.appStore['e1'], 'Milk');
+    expect(pulls, greaterThanOrEqualTo(2));
+  });
+
+  test(
+    'syncOnce replays when the application domain is behind library metadata',
+    () async {
+      final h = await _Harness.open();
+      h.fake.onPull = ({required int since, int? limit}) async {
+        if (since == 0) {
+          return PullPage(
+            envelopes: [
+              _memoEnvelope(id: 'e1', serverSeq: 1, text: 'Milk'),
+              _memoEnvelope(id: 'e2', serverSeq: 2, text: 'Bread'),
+            ],
+            nextCursor: 2,
+          );
+        }
+        return PullPage(envelopes: const [], nextCursor: since);
+      };
+      await h.client.syncOnce();
+      expect(h.applies, 2);
+
+      // Sign-in cleared the journal; metadata and cursor stayed on disk.
+      h.appStore.clear();
+      h.applyCount[0] = 0;
+
+      final report = await h.client.syncOnce();
+      expect(h.applies, 2);
+      expect(h.appStore['e1'], 'Milk');
+      expect(h.appStore['e2'], 'Bread');
+      expect(report.cursor, 2);
+      expect(h.fake.pullCalls.where((call) => call.since == 0), hasLength(2));
+    },
+  );
 
   test(
     'syncOnce replays from since=0 when local cursor is ahead of server feed',

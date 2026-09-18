@@ -114,6 +114,11 @@ final class FakeHelloTransport
   }
 
   @override
+  Future<void> pokeLive() async {
+    _ensureOpen();
+  }
+
+  @override
   Future<void> close() async {
     if (closed) {
       return;

@@ -1,8 +1,8 @@
 # ulsync example — self-hosted to-do list
 
 **Created:** 2026-09-17 17:05:37 +0300  
-**Updated:** 2026-09-17 17:05:37 +0300  
-**Version:** 1  
+**Updated:** 2026-09-18 13:21:00 +0300  
+**Version:** 3  
 **Document type:** readme
 
 ## What this is
@@ -12,11 +12,13 @@ your own `ulsync-server`, prove it with `GET /health`, sign in with an access
 key and `GET /v1/whoami`, then keep a to-do list in sync across two macOS
 windows. Text, done checkboxes, trash, restore, and **Move done to trash**
 (one `writeAll` batch) all ride the round-2 API: named parts (`full`, `done`,
-`deleted`) and batched push.
+`deleted`) as one **indivisible, complete** kit per to-do, and batched push
+that never cuts that kit at the SPEC ceiling of 500.
 
 Each window is a separate process with its own **device name** (`phone`,
-`tablet`) and metadata file. The session strip shows **Live · host:port** or
-**Offline · saved on this device** — never the bearer token.
+`tablet`). The library opens a separate metadata instance per name; the app
+does not resolve a filesystem path. The session strip shows **Live ·
+host:port** or **Offline · saved on this device** — never the bearer token.
 
 ## There is no cloud alice
 
@@ -89,8 +91,8 @@ key**, not Base URL / Token / Connect.
 Quit all `ulsync_example.app` windows (**Cmd+Q**), then:
 
 ```bash
-rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_phone.db
-rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Documents/ulsync_example_tablet.db
+rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Library/Application\ Support/dev.ulsync.ulsyncExample/ulsync/phone.db
+rm -f ~/Library/Containers/dev.ulsync.ulsyncExample/Data/Library/Application\ Support/dev.ulsync.ulsyncExample/ulsync/tablet.db
 ```
 
 Reset the server SQLite file you use in your YAML when you need an empty store.
@@ -118,10 +120,11 @@ Both should show `Live · 127.0.0.1:8080` (or briefly `Connecting · …`).
 The cloud icon in the app bar (**Work offline**) mutes **this window only**.
 It is not airplane mode. The engine has no pause: cancelling the live
 *subscription* does not stop ingest. This sample **closes** the client and
-reopens the same metadata file **without** `live()`, so local `write` /
-`writeAll` still queue. Going online again is `syncOnce` (push dirty, then
-pull) plus `live()`. Do not `syncOnce` on the way *into* offline — that
-would pull the remote edits the mute is meant to hold back.
+calls `UlsyncClient.open` again with the **same device name** **without**
+`live()`, so local `write` / `writeAll` still queue. Going online again is
+`syncOnce` (push dirty, then pull) plus `live()`. Do not `syncOnce` on the
+way *into* offline — that would pull the remote edits the mute is meant to
+hold back.
 
 ## Trash and batch
 
