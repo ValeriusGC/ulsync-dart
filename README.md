@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 15:28:05 +0300  
-**Version:** 18  
+**Updated:** 2026-09-18 21:12:04 +0300  
+**Version:** 19  
 **Document type:** readme
 
 ## What this is
@@ -365,6 +365,27 @@ engine cannot see isolate sleep; a half-open socket can look healthy
 until the application reports a wake. That kick is not a network
 detector.
 
+## Clocks
+
+Last-write-wins still ranks `last_edited_at_ms`, then `revision`, then
+`source_id`. Completeness of mail is still `server_seq`. After a
+successful hello (or a pull / live `cursor` that carries the same
+field), outgoing `last_edited_at_ms` is store time plus a device offset
+the engine keeps: `nowMs + (server_now_ms − nowMs)` at the sample. The
+application does not call NTP, does not set the OS clock, and does not
+pass `nowMs` in production — that argument is a test hatch, like
+`inMemory`.
+
+Until the first sample, stamps are the device clock. On the transition
+from “no sample” to “sampled”, the engine adds the new offset to dirty
+rows of **this** installation’s `source_id` only. Incoming envelopes
+keep the ranks they arrived with. A later sample does not rewrite the
+dirty queue again. Intentional clock tampering after a sample is not
+promised (proposal §12.1).
+
+Lab proof is engine tests with an injected `nowMs`, not an OS clock
+dialog and not a “simulate skew” control in the example.
+
 ## Named parts
 
 See **Record kits (indivisible and complete)** above. This section is the
@@ -541,8 +562,9 @@ in the library metadata file the `name` argument selects.
   dirty.
 - There is no tombstone type. Hiding a record is an application part
   the library does not interpret. `flags` stay `0`.
-- No payload compression, no clock-skew correction, no content schema
-  migrations inside the library.
+- No payload compression, no content schema migrations inside the
+  library. Outgoing stamps after a store-clock sample use the engine
+  offset (see **Clocks**). The application does not call NTP.
 - The library does not call `syncOnce` on a timer for battery. After
   `live()` starts, a local `write` schedules catch-up, and drop, 5xx,
   and TCP death are retried by the engine until `close()`. A frozen
