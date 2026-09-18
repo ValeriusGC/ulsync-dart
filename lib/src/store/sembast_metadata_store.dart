@@ -206,10 +206,12 @@ final class SembastMetadataStore {
   }
 
   /// Clears [dirty] only when the stored revision still equals
-  /// [expectedRevision].
+  /// [expectedRevision] and the row is still dirty.
   ///
   /// Returns `true` when the flag was cleared, `false` when the record is
-  /// missing or was edited again after the push started.
+  /// missing, already clean, or was edited again after the push started.
+  /// HTTP push holds no engine lock, so a later persist of the same cell
+  /// must not be wiped by the `200` for the older snapshot.
   Future<bool> clearDirty({
     required String userScope,
     required String entityType,
@@ -228,6 +230,9 @@ final class SembastMetadataStore {
     return _db.transaction((txn) async {
       final stored = await record.get(txn);
       if (stored == null || stored['revision'] != expectedRevision) {
+        return false;
+      }
+      if (stored['dirty'] != true) {
         return false;
       }
       await record.update(txn, {'dirty': false});

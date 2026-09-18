@@ -1,5 +1,11 @@
 /// Sync engine: dirty queue, last-write-wins apply, live feed, one mutex.
 ///
+/// HTTP push and pull do not hold the mutex: a local [UlsyncClient.write]
+/// must not wait on the transport timeout. After a local edit, if
+/// [UlsyncClient.live] has already been started, the engine drains dirty
+/// itself. Work-offline mute is [UlsyncClient.live] never started: write
+/// does not push.
+///
 /// A record kit (`full` plus every named part of one id) is **indivisible**
 /// and must be **complete**. Push, pull, and diff never cut that set at
 /// the SPEC ceiling of 500; ingest never drops a cell because another
@@ -170,6 +176,10 @@ final class WriteOp {
 ///   ([kReconnectInterval], silence watchdog).
 /// - Run [syncOnce] after every [SyncConnectionRestored] until push/pull
 ///   succeed, so envelopes missed while the socket was down still land.
+/// - After a local [write] / [writeAll] / [markChanged], if [live] has
+///   already been started, schedule that same catch-up. The application
+///   does not call [syncOnce] after each edit. If [live] has not been
+///   started, push is not invoked (Work-offline mute).
 /// - Restart [live] if the transport stream ends without [close].
 /// - Replay from `since=0` when the local cursor is ahead of the server,
 ///   or when metadata still names any cell of a kit (`full` or a named
@@ -230,9 +240,9 @@ final class UlsyncClient {
   /// which would import Flutter into `lib/` and fail the import guard.
   ///
   /// [catchUpRetryDelay] is the pause between [syncOnce] attempts after a
-  /// network miss on live restore or [notifyResumed]. Production keeps the
-  /// default. Tests pass [Duration.zero] so a scripted failure does not
-  /// wait a second.
+  /// network miss on live restore, a local edit while [live] is running,
+  /// or [notifyResumed]. Production keeps the default. Tests pass
+  /// [Duration.zero] so a scripted failure does not wait a second.
   ///
   /// [pushBatchLimit] and [pullPageLimit] default to [kSpecBatchLimit].
   /// Tests pass a smaller ceiling to prove a record kit is not split at
@@ -367,9 +377,10 @@ final class UlsyncClient {
 
   /// Pause between catch-up [syncOnce] attempts after a transport miss.
   ///
-  /// The engine keeps trying until the server answers or [close]. A 4xx
-  /// ([UlsyncUnauthorized], [UlsyncRequestRejected]) stops the loop: the
-  /// request is wrong, not "server down".
+  /// Used after live restore, [notifyResumed], and a local edit while
+  /// [live] is running. The engine keeps trying until the server answers
+  /// or [close]. A 4xx ([UlsyncUnauthorized], [UlsyncRequestRejected])
+  /// stops the loop: the request is wrong, not "server down".
   final Duration _catchUpRetryDelay;
 
   /// Ceiling for one push. Record kits are packed to fit; they are not cut.
@@ -428,8 +439,21 @@ final class UlsyncClient {
   /// Completes when [_runLive] exits; awaited in [close] before store close.
   Future<void>? _liveDone;
 
-  /// In-flight catch-up after restore or [notifyResumed]. One at a time.
+  /// In-flight catch-up after restore, a local edit, or [notifyResumed].
+  ///
+  /// One loop at a time. A kick that arrives while this is set must not
+  /// start a second HTTP exchange; it sets [_catchUpPending] so the
+  /// running loop drains the newer revision after the in-flight POST.
   Completer<void>? _catchUpGate;
+
+  /// Whether another catch-up kick arrived while [_catchUpGate] was held.
+  ///
+  /// Without this, a [write] during a hanging POST joins the in-flight
+  /// loop, that loop's [syncOnce] succeeds without posting the new
+  /// revision, and dirty sits until the next user gesture. Mute does not
+  /// set this: [_scheduleCatchUpAfterLocalEdit] does not run unless
+  /// [_liveStarted] is true.
+  bool _catchUpPending = false;
 
   /// Outward events. Broadcast so a late subscriber does not throw; events
   /// with no listener are dropped (subscribe before [syncOnce] if you need
@@ -440,13 +464,17 @@ final class UlsyncClient {
   /// Mutex tail. Each [_serialized] call waits for this, then replaces it.
   ///
   /// Covers [markChanged], the whole of [write] and [writeAll] including
-  /// every persist callback, the whole of [syncOnce], and **one** live
-  /// message — not the live subscription itself. Holding the lock for the
-  /// lifetime of [live] would make [syncOnce] wait forever. Releasing it
-  /// between the dirty mark of [write] and persist would let [syncOnce]
-  /// clear the mark after `load` returned `null`. Releasing it between
-  /// items of [writeAll] would let the live feed POST the first rows of a
-  /// related edit.
+  /// every persist callback, the **snapshot** of a push batch and the
+  /// **clear** of dirty after HTTP returns, pull/live **ingest** of one
+  /// page or one live message, and domain reconcile — not the live
+  /// subscription itself, and **not** HTTP push or pull. Holding the lock
+  /// across `_transport.push` / `pull` would make the next [write] wait
+  /// on [kPushPullTimeout] (30s): that is a pause of input, not of
+  /// exchange. Holding the lock for the lifetime of [live] would make
+  /// [syncOnce] wait forever. Releasing it between the dirty mark of
+  /// [write] and persist would let [syncOnce] clear the mark after `load`
+  /// returned `null`. Releasing it between items of [writeAll] would let
+  /// the live feed POST the first rows of a related edit.
   Future<void> _tail = Future<void>.value();
 
   /// Records a local edit: bumps revision, sets dirty, writes metadata.
@@ -468,6 +496,12 @@ final class UlsyncClient {
   /// slice the next push will refuse to encode. Prefer [write], which
   /// throws [StateError] before marking when the encoder is missing.
   ///
+  /// This future returns after the metadata persist. It does not wait for
+  /// the network and does not throw [UlsyncNetworkException]. If [live]
+  /// has been started, the engine schedules catch-up; the application
+  /// does not call [syncOnce] after each mark. If [live] has not been
+  /// started, this is Work-offline mute: push is not invoked.
+  ///
   /// The engine owns the revision. The application must not mint it: a stale
   /// number loses a last-write-wins tie and the edit disappears silently.
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
@@ -477,10 +511,10 @@ final class UlsyncClient {
     required String entityType,
     required String id,
     String part = kEnvelopePart,
-  }) {
+  }) async {
     _ensureOpen();
     final trimmedPart = _requireNonEmpty(part, 'part');
-    return _serialized(() async {
+    await _serialized(() async {
       _ensureOpen();
       final adapter = _adapters[entityType];
       if (adapter == null) {
@@ -497,18 +531,25 @@ final class UlsyncClient {
         part: trimmedPart,
       );
     });
+    _scheduleCatchUpAfterLocalEdit();
   }
 
-  /// Marks [id] dirty, then runs [persist] while holding the serial lock.
+  /// Records a local edit and returns after [persist] finishes.
   ///
-  /// This is the recommended way to record a local edit. The dirty mark is
-  /// written **before** [persist] runs. The two stores (library metadata and
-  /// the application's database) cannot share a transaction, so a crash in
-  /// the middle must choose a side: a mark without data is healed on the
-  /// next push (`load` or [EntityAdapter.encodePart] returns `null` and the
-  /// engine clears dirty). Data without a mark is a silent permanent loss.
-  /// That is why the order is not reversed even when "write the row first"
-  /// looks more natural.
+  /// This future does not wait for the network and does not throw
+  /// [UlsyncNetworkException]. The dirty mark is already stored. If [live]
+  /// has been started, the engine schedules catch-up; the application does
+  /// not call [syncOnce] after each edit. If [live] has not been started,
+  /// this is Work-offline mute: push is not invoked.
+  ///
+  /// The dirty mark is written **before** [persist] runs. The two stores
+  /// (library metadata and the application's database) cannot share a
+  /// transaction, so a crash in the middle must choose a side: a mark
+  /// without data is healed on the next push (`load` or
+  /// [EntityAdapter.encodePart] returns `null` and the engine clears
+  /// dirty). Data without a mark is a silent permanent loss. That is why
+  /// the order is not reversed even when "write the row first" looks more
+  /// natural.
   ///
   /// [part] names the envelope cell. Default [kEnvelopePart] (`full`).
   /// Identity is `(id, part)`: a checkbox and a hide flag on the same
@@ -520,16 +561,19 @@ final class UlsyncClient {
   /// is not left behind.
   ///
   /// The same serial lock covers [persist]. Releasing it between the mark
-  /// and the application write would let a concurrent [syncOnce] observe
+  /// and the application write would let a concurrent drain observe
   /// dirty, load `null`, and clear the mark — the loss this method exists
-  /// to prevent.
+  /// to prevent. HTTP push/pull do **not** hold that lock: a second
+  /// [write] must finish in persist time, not in the 30-second transport
+  /// timeout.
   ///
   /// Do not call [UlsyncClient] methods from [persist]. That would wait on
   /// this lock forever. The engine throws a [StateError] instead of hanging.
   /// Write only application data there.
   ///
   /// Returns whatever [persist] returns. If [persist] throws, the error is
-  /// rethrown as-is and the dirty mark remains.
+  /// rethrown as-is, the dirty mark remains, and catch-up is not scheduled
+  /// from this call.
   ///
   /// Throws [ArgumentError] when no adapter is registered for [entityType]
   /// (the store is not touched, [persist] does not run). Throws [StateError]
@@ -540,10 +584,10 @@ final class UlsyncClient {
     required String id,
     required Future<T> Function() persist,
     String part = kEnvelopePart,
-  }) {
+  }) async {
     _ensureOpen();
     final trimmedPart = _requireNonEmpty(part, 'part');
-    return _serialized(() async {
+    final result = await _serialized(() async {
       _ensureOpen();
       return _writeOneLocked(
         entityType: entityType,
@@ -552,21 +596,31 @@ final class UlsyncClient {
         persist: persist,
       );
     });
+    _scheduleCatchUpAfterLocalEdit();
+    return result;
   }
 
   /// Applies several [write] operations under the same lock as a single [write].
   ///
   /// Use this for one user action that touches many rows ("move done to trash").
-  /// Live sync and [syncOnce] wait until every persist finished, so the feed
-  /// cannot POST the first five while the rest are still being marked. Each
-  /// [WriteOp.part] is one cell of an **indivisible** kit: `full` and `deleted`
-  /// of the same id must both be marked if both changed; the send queue will
-  /// not split that kit at the SPEC ceiling.
+  /// This future returns after every persist in [ops] finishes. It does not
+  /// wait for the network and does not throw [UlsyncNetworkException]. Live
+  /// ingest waits until every persist finished, so the feed cannot POST the
+  /// first five while the rest are still being marked. Each [WriteOp.part] is
+  /// one cell of an **indivisible** kit: `full` and `deleted` of the same id
+  /// must both be marked if both changed; the send queue will not split that
+  /// kit at the SPEC ceiling.
   ///
-  /// An empty list is a no-op, not an error. If persist of item 5 throws, items
-  /// 1–5 are marked dirty and 6…N have not started — the same contract as a
-  /// throwing single [write]. This method does not open a database transaction
-  /// across the application store and the metadata store: those are two files.
+  /// If [live] has been started, the engine schedules catch-up after persist;
+  /// the application does not call [syncOnce] after the related edit. If
+  /// [live] has not been started, this is Work-offline mute: push is not
+  /// invoked.
+  ///
+  /// An empty list is a no-op, not an error, and does not schedule catch-up.
+  /// If persist of item 5 throws, items 1–5 are marked dirty and 6…N have
+  /// not started — the same contract as a throwing single [write]. This
+  /// method does not open a database transaction across the application
+  /// store and the metadata store: those are two files.
   ///
   /// Each item is checked, marked, and persisted in list order, with the same
   /// adapter and [EntityAdapter.encodePart] rules as [write]. Do not call
@@ -575,12 +629,12 @@ final class UlsyncClient {
   /// Throws [ArgumentError] when an item names an unknown [WriteOp.entityType]
   /// or a blank [WriteOp.part]. Throws [StateError] after [close], when called
   /// from inside a persist callback, or when a named part has no encoder.
-  Future<void> writeAll(List<WriteOp> ops) {
+  Future<void> writeAll(List<WriteOp> ops) async {
     if (ops.isEmpty) {
-      return Future<void>.value();
+      return;
     }
     _ensureOpen();
-    return _serialized(() async {
+    await _serialized(() async {
       _ensureOpen();
       for (final op in ops) {
         await _writeOneLocked(
@@ -591,6 +645,7 @@ final class UlsyncClient {
         );
       }
     });
+    _scheduleCatchUpAfterLocalEdit();
   }
 
   /// Marks one row and runs [persist] while the caller already holds
@@ -727,6 +782,13 @@ final class UlsyncClient {
 
   /// Pushes the dirty queue, then pulls until a short page.
   ///
+  /// Public method for first sign-in, leaving Work-offline mute, and tests.
+  /// With [live] running the application does **not** retry a store outage
+  /// by calling this after each edit or from [SyncConnectionLost] /
+  /// [SyncConnectionRestored]: the engine already catch-up-retries. A
+  /// formula that "there is no retry timer, so the application calls this
+  /// again" would put the drain back on author memory.
+  ///
   /// Push posts **complete, indivisible** record kits: `full` and every
   /// named part of one id travel in the same POST, even when that leaves
   /// the request shorter than [kSpecBatchLimit]. Pull holds a trailing kit
@@ -739,14 +801,23 @@ final class UlsyncClient {
   /// inside [_serialized] — the lock is not re-entrant, and that call
   /// would hang forever.
   ///
-  /// Before pull, the engine **auto-heals** when the stored cursor is ahead
-  /// of the server feed head (see README, *Local metadata*). Push and pull run
-  /// under the same lock so they cannot race the live ingest. A network or
-  /// HTTP `5xx` error is thrown; `dirty` stays set and the application calls
-  /// this again. There is no retry timer inside the library.
+  /// HTTP push and pull run **outside** [_serialized]. The batch snapshot
+  /// (load, encode, pack) is under the lock; the POST is not; dirty is
+  /// cleared under the lock only when the stored `(id, part, revision)`
+  /// still matches the snapshot. Clearing "everything we tried to send"
+  /// would drop a [write] of the same cell that landed while the POST was
+  /// in flight. Pull ingest of one page stays serialized with persist, as
+  /// does one live message, so the feed cannot POST half of a [writeAll].
   ///
-  /// `applied: false` still clears dirty: the server already holds a
-  /// non-inferior row (SPEC section 7). Leaving dirty set retries forever.
+  /// Before pull, the engine **auto-heals** when the stored cursor is ahead
+  /// of the server feed head (see README, *Local metadata*). A network or
+  /// HTTP `5xx` error is thrown; `dirty` stays set. Catch-up retries those
+  /// errors. `4xx` ([UlsyncUnauthorized], [UlsyncRequestRejected]) stops
+  /// catch-up: the request is wrong, not "server down".
+  ///
+  /// `applied: false` still clears dirty when the revision still matches:
+  /// the server already holds a non-inferior row (SPEC section 7). Leaving
+  /// dirty set retries forever.
   Future<SyncReport> syncOnce() async {
     _ensureOpen();
     await _ensureOrigin();
@@ -765,24 +836,24 @@ final class UlsyncClient {
       prelude = Future<void>.value();
     }
     return prelude
-        .then((_) {
+        .then((_) async {
           _ensureOpen();
-          return _serialized(() async {
+          final counters = _SyncCounters();
+          await _pushDirty(counters);
+          await _serialized(() async {
             _ensureOpen();
-            final counters = _SyncCounters();
-            await _pushDirty(counters);
             await _ensureCursorLoaded();
             await _reconcileDomainBehindMetadata();
-            await _reconcileCursorIfAhead();
-            await _pullPages(counters);
-            return SyncReport(
-              pushed: counters.pushed,
-              accepted: counters.accepted,
-              pulled: counters.pulled,
-              applied: counters.applied,
-              cursor: _appliedCursor,
-            );
           });
+          await _reconcileCursorIfAhead();
+          await _pullPages(counters);
+          return SyncReport(
+            pushed: counters.pushed,
+            accepted: counters.accepted,
+            pulled: counters.pulled,
+            applied: counters.applied,
+            cursor: _appliedCursor,
+          );
         })
         .then((report) {
           if (!_selfCheckRunning) {
@@ -799,7 +870,8 @@ final class UlsyncClient {
   /// after [_ensureOrigin]. The applied cursor is loaded and auto-healed
   /// when ahead of the server feed head. Reopens call `appliedSince`
   /// again and see the cursor as of **now**, not as of the first [live]
-  /// call.
+  /// call. Later [write] calls schedule catch-up; this method does not
+  /// start [live] from [write], and [write] does not start [live].
   ///
   /// This does **not** replace [notifyResumed]. A frozen isolate still
   /// looks connected until the application reports a wake.
@@ -818,15 +890,17 @@ final class UlsyncClient {
   /// `lib/` must not import Flutter, so [UlsyncClient] cannot observe
   /// `AppLifecycleState`. A suspended isolate does not run Dart timers:
   /// the live silence watchdog sleeps, and a half-open TCP socket can
-  /// still look healthy. Without this call, catch-up waits until that
-  /// watchdog (45s after the isolate actually runs again) or until the
-  /// next local [write].
+  /// still look healthy. The engine sees a store TCP drop on its own and
+  /// catch-up-retries; it cannot see isolate sleep. Without this call,
+  /// catch-up waits until that watchdog (45s after the isolate actually
+  /// runs again).
   ///
   /// Call from `WidgetsBindingObserver.didChangeAppLifecycleState` when
   /// the state is `AppLifecycleState.resumed` (lock screen, app switcher,
   /// laptop sleep, first frame after a killed isolate). Tests call it
   /// when their host wakes. Do **not** call it on every [SyncEvent]; the
-  /// engine already catch-up-retries after [SyncConnectionRestored].
+  /// engine already catch-up-retries after [SyncConnectionRestored] and
+  /// after a local [write] while [live] is running.
   ///
   /// Drops the current live body immediately ([SyncTransport.pokeLive]),
   /// then runs [syncOnce] until push/pull succeed or [close]. Network
@@ -1184,8 +1258,14 @@ final class UlsyncClient {
   /// After a server-side store reset, clients can keep a high sembast cursor
   /// and skip live catch-up. The server is read-only here: replay from
   /// `since=0` and idempotent [EntityAdapter.apply] realign the client.
+  /// The feed-head probe is HTTP and must not hold [_serialized]; only the
+  /// cursor read and the reset do.
   Future<void> _reconcileCursorIfAhead() async {
-    final local = _appliedCursor;
+    final local = await _serialized(() async {
+      _ensureOpen();
+      await _ensureCursorLoaded();
+      return _appliedCursor;
+    });
     if (local == 0) {
       return;
     }
@@ -1193,8 +1273,10 @@ final class UlsyncClient {
     if (local <= head) {
       return;
     }
-    await _store.resetCursor(userScope);
-    _appliedCursor = 0;
+    await _serialized(() async {
+      await _store.resetCursor(userScope);
+      _appliedCursor = 0;
+    });
   }
 
   /// Sends one complete-kit push, at most [_pushBatchLimit] envelopes.
@@ -1205,9 +1287,17 @@ final class UlsyncClient {
   /// kit is forbidden. Dirty marks of posted rows are not cleared before
   /// that call returns.
   /// A thrown transport error (including HTTP 413) leaves every posted row
-  /// dirty so the next [syncOnce] retries the same related edit. Clearing a
+  /// dirty so the next drain retries the same related edit. Clearing a
   /// prefix on the way in would drop half a [writeAll] after a dropped
   /// connection — the hole this method exists to close.
+  ///
+  /// Snapshot (pack, load, encode) runs under [_serialized]. HTTP
+  /// `_transport.push` runs **outside** the lock so a parallel [write]
+  /// finishes in persist time, not in the transport timeout. After `200`,
+  /// dirty is cleared under the lock only when the cell is still dirty and
+  /// [EntityState.revision] still equals the posted snapshot. Clearing
+  /// "everything we tried to send" would drop a revision that landed while
+  /// the POST was in flight.
   ///
   /// Rows with no adapter, or whose load / [EntityAdapter.encodePart]
   /// returns `null`, are cleared without entering the POST — the same skip
@@ -1218,63 +1308,69 @@ final class UlsyncClient {
   /// envelope *i* (`id` and `part`). Otherwise this throws
   /// [UlsyncProtocolException] and does not clear posted marks. After one
   /// successful response, both `applied: true` and `applied: false` clear
-  /// dirty (SPEC section 7).
+  /// dirty when the revision still matches (SPEC section 7).
   ///
   /// HTTP 413 is [UlsyncRequestRejected] like any other 4xx. There is no
   /// second send path that posts the same rows one envelope at a time: a
   /// new client against a server whose limit is still 1 is a named
   /// incompatibility, and two send paths would drift.
   Future<void> _pushDirty(_SyncCounters counters) async {
-    final dirty = await _store.allDirty(userScope);
-    final batch = packCompleteRecordKits(dirty, limit: _pushBatchLimit);
-    if (batch.isEmpty) {
+    final prepared = await _serialized(() async {
+      final dirty = await _store.allDirty(userScope);
+      final batch = packCompleteRecordKits(dirty, limit: _pushBatchLimit);
+      if (batch.isEmpty) {
+        return (postedRows: <EntityState>[], envelopes: <Envelope>[]);
+      }
+      final postedRows = <EntityState>[];
+      final envelopes = <Envelope>[];
+      for (final row in batch) {
+        _ensureOpen();
+        final adapter = _adapters[row.entityType];
+        if (adapter == null) {
+          await _clearDirty(row);
+          continue;
+        }
+        final payload = await _payloadForDirtyRow(row, adapter);
+        if (payload == null) {
+          await _clearDirty(row);
+          continue;
+        }
+        final createdAtMs = row.createdAtMs <= 0 ? 1 : row.createdAtMs;
+        final lastEditedAtMs = row.lastEditedAtMs <= 0 ? 1 : row.lastEditedAtMs;
+        postedRows.add(row);
+        envelopes.add(
+          Envelope(
+            id: row.id,
+            part: row.part,
+            entityType: row.entityType,
+            createdAtMs: createdAtMs,
+            lastEditedAtMs: lastEditedAtMs,
+            revision: row.revision,
+            sourceId: row.sourceId,
+            flags: kFlags,
+            schemaVersion: row.schemaVersion,
+            payloadEncoding: kPayloadEncoding,
+            payload: payload,
+          ),
+        );
+      }
+      return (postedRows: postedRows, envelopes: envelopes);
+    });
+    if (prepared.envelopes.isEmpty) {
       return;
     }
-    final postedRows = <EntityState>[];
-    final envelopes = <Envelope>[];
-    for (final row in batch) {
+    final results = await _transport.push(prepared.envelopes);
+    _requirePushResultsMatch(prepared.envelopes, results);
+    await _serialized(() async {
       _ensureOpen();
-      final adapter = _adapters[row.entityType];
-      if (adapter == null) {
-        await _clearDirty(row);
-        continue;
+      for (var i = 0; i < prepared.postedRows.length; i++) {
+        await _clearDirty(prepared.postedRows[i]);
+        counters.pushed++;
+        if (results[i].applied) {
+          counters.accepted++;
+        }
       }
-      final payload = await _payloadForDirtyRow(row, adapter);
-      if (payload == null) {
-        await _clearDirty(row);
-        continue;
-      }
-      final createdAtMs = row.createdAtMs <= 0 ? 1 : row.createdAtMs;
-      final lastEditedAtMs = row.lastEditedAtMs <= 0 ? 1 : row.lastEditedAtMs;
-      postedRows.add(row);
-      envelopes.add(
-        Envelope(
-          id: row.id,
-          part: row.part,
-          entityType: row.entityType,
-          createdAtMs: createdAtMs,
-          lastEditedAtMs: lastEditedAtMs,
-          revision: row.revision,
-          sourceId: row.sourceId,
-          flags: kFlags,
-          schemaVersion: row.schemaVersion,
-          payloadEncoding: kPayloadEncoding,
-          payload: payload,
-        ),
-      );
-    }
-    if (envelopes.isEmpty) {
-      return;
-    }
-    final results = await _transport.push(envelopes);
-    _requirePushResultsMatch(envelopes, results);
-    for (var i = 0; i < postedRows.length; i++) {
-      await _clearDirty(postedRows[i]);
-      counters.pushed++;
-      if (results[i].applied) {
-        counters.accepted++;
-      }
-    }
+    });
   }
 
   /// Resolves payload bytes for a dirty [row], or `null` when there is
@@ -1318,6 +1414,10 @@ final class UlsyncClient {
   /// kit. A full page holds the trailing `(entityType, id)` so `full` and
   /// named parts that straddle [_pullPageLimit] are not cut. Applying
   /// `full` does not complete the id.
+  ///
+  /// HTTP `pull` runs outside [_serialized]. Ingest of the page is under
+  /// the lock, same as one live message, so persist of a [writeAll] cannot
+  /// interleave with applying half a kit.
   Future<void> _pullPages(_SyncCounters counters) async {
     while (true) {
       _ensureOpen();
@@ -1326,28 +1426,35 @@ final class UlsyncClient {
         since: sinceUsed,
         limit: _pullPageLimit,
       );
-      if (page.envelopes.isEmpty) {
-        await _advanceCursor(page.nextCursor);
-        break;
-      }
-      final ingestLength = pullIngestLength(page.envelopes, _pullPageLimit);
-      for (var i = 0; i < ingestLength; i++) {
-        counters.pulled++;
-        await _ingest(
-          page.envelopes[i],
-          countInReport: true,
-          counters: counters,
-        );
-      }
-      if (ingestLength == page.envelopes.length) {
-        await _advanceCursor(page.nextCursor);
-      } else if (_appliedCursor <= sinceUsed) {
-        break;
-      }
-      if (page.envelopes.length < _pullPageLimit) {
-        break;
-      }
-      if (page.nextCursor <= sinceUsed) {
+      final done = await _serialized(() async {
+        _ensureOpen();
+        if (page.envelopes.isEmpty) {
+          await _advanceCursor(page.nextCursor);
+          return true;
+        }
+        final ingestLength = pullIngestLength(page.envelopes, _pullPageLimit);
+        for (var i = 0; i < ingestLength; i++) {
+          counters.pulled++;
+          await _ingest(
+            page.envelopes[i],
+            countInReport: true,
+            counters: counters,
+          );
+        }
+        if (ingestLength == page.envelopes.length) {
+          await _advanceCursor(page.nextCursor);
+        } else if (_appliedCursor <= sinceUsed) {
+          return true;
+        }
+        if (page.envelopes.length < _pullPageLimit) {
+          return true;
+        }
+        if (page.nextCursor <= sinceUsed) {
+          return true;
+        }
+        return false;
+      });
+      if (done) {
         break;
       }
     }
@@ -1499,7 +1606,11 @@ final class UlsyncClient {
     _emit(SyncCursorAdvanced(_appliedCursor));
   }
 
-  /// Clears dirty only if [row.revision] is still the stored revision.
+  /// Clears dirty only if [row] is still dirty at [row.revision].
+  ///
+  /// HTTP is outside [_serialized], so a [write] of the same cell during
+  /// the POST bumps revision. Clearing without this match would drop that
+  /// edit. [SembastMetadataStore.clearDirty] is the atomic compare.
   Future<void> _clearDirty(EntityState row) {
     return _store.clearDirty(
       userScope: userScope,
@@ -1613,11 +1724,15 @@ final class UlsyncClient {
   ///
   /// Live reconnect is not enough: envelopes missed while the socket was
   /// down (or while the isolate was frozen) need a pull. Concurrent calls
-  /// share one loop. [UlsyncUnauthorized] and [UlsyncRequestRejected] stop
-  /// retrying; transport and network errors keep trying.
+  /// share one loop. A kick while the loop is in flight sets
+  /// [_catchUpPending] so a newer revision written during the POST is
+  /// drained after that POST, not left until the next gesture.
+  /// [UlsyncUnauthorized] and [UlsyncRequestRejected] stop retrying;
+  /// transport and network errors keep trying.
   Future<void> _catchUpUntilReachable() {
     final existing = _catchUpGate;
     if (existing != null) {
+      _catchUpPending = true;
       return existing.future;
     }
     final gate = Completer<void>();
@@ -1625,10 +1740,26 @@ final class UlsyncClient {
     unawaited(() async {
       try {
         var delay = _catchUpRetryDelay;
+        var lastDirty = 1 << 30;
         while (!_closed) {
+          _catchUpPending = false;
           try {
             await syncOnce();
-            return;
+            if (_closed) {
+              return;
+            }
+            if (_catchUpPending) {
+              lastDirty = 1 << 30;
+              continue;
+            }
+            final remaining = await _dirtyCount();
+            if (remaining == 0) {
+              return;
+            }
+            if (remaining >= lastDirty) {
+              return;
+            }
+            lastDirty = remaining;
           } on UlsyncUnauthorized {
             return;
           } on UlsyncRequestRejected {
@@ -1657,6 +1788,18 @@ final class UlsyncClient {
       }
     }());
     return gate.future;
+  }
+
+  /// Starts catch-up after a successful local persist, only if [live] ran.
+  ///
+  /// Work-offline mute is `close` + `open` without [live]. Scheduling
+  /// push from [write] in that state would start talking while the window
+  /// is meant to be silent. This must not start [live] itself.
+  void _scheduleCatchUpAfterLocalEdit() {
+    if (_closed || !_liveStarted) {
+      return;
+    }
+    unawaited(_catchUpUntilReachable());
   }
 
   /// Adds [event] when the client is still open.

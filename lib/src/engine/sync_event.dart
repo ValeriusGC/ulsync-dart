@@ -69,7 +69,9 @@ final class SyncConnectionLost extends SyncEvent {
 ///
 /// Clear disconnected UI state. The engine then retries
 /// [UlsyncClient.syncOnce] until push/pull succeed; the application must
-/// not duplicate that catch-up here.
+/// not duplicate that catch-up here, and must not call
+/// [UlsyncClient.syncOnce] after each local [UlsyncClient.write] while
+/// the feed is running.
 final class SyncConnectionRestored extends SyncEvent {
   /// Creates a restored-connection event.
   const SyncConnectionRestored();
