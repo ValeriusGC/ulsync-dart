@@ -108,16 +108,26 @@ final class PushResult {
 ///
 /// The cursor of an empty page is the value the **server** sent, not a
 /// client-computed `since`. A missing `next_cursor` is a protocol error.
+/// [serverNowMs] is the optional store clock on that `200`. Missing is
+/// [null], not a protocol error: the engine does not update its offset.
 final class PullPage {
   /// Creates a page with a defensive copy of [envelopes].
-  PullPage({required List<Envelope> envelopes, required this.nextCursor})
-    : envelopes = List<Envelope>.unmodifiable(envelopes);
+  PullPage({
+    required List<Envelope> envelopes,
+    required this.nextCursor,
+    this.serverNowMs,
+  }) : envelopes = List<Envelope>.unmodifiable(envelopes);
 
   /// Envelopes in `server_seq` order. Empty when nothing is new.
   final List<Envelope> envelopes;
 
   /// Exclusive cursor to pass as the next `since`.
   final int nextCursor;
+
+  /// Store Unix milliseconds at this response, or `null` when the key
+  /// was absent. The engine samples this; it does not rewrite incoming
+  /// envelope ranks.
+  final int? serverNowMs;
 }
 
 /// One item from the live Server-Sent Events feed.
@@ -156,10 +166,25 @@ final class LiveEnvelope extends LiveMessage {
 /// An `event: cursor` payload with the server's `next_cursor`.
 final class LiveCursor extends LiveMessage {
   /// Creates a cursor message for [nextCursor].
-  const LiveCursor(this.nextCursor);
+  ///
+  /// [serverNowMs] is the optional store clock on that JSON. Absence is
+  /// not a live-protocol failure: the engine leaves its offset unchanged.
+  const LiveCursor(this.nextCursor, {this.serverNowMs});
 
   /// Exclusive cursor to pass as the next `since` after this burst.
   final int nextCursor;
+
+  /// Store Unix milliseconds at this cursor event, or `null` when omitted.
+  final int? serverNowMs;
+
+  /// Parses live `event: cursor` JSON. `next_cursor` is required;
+  /// `server_now_ms` may be absent.
+  factory LiveCursor.fromJson(Map<String, Object?> json) {
+    return LiveCursor(
+      _diffRequireInt(json, 'next_cursor'),
+      serverNowMs: readOptionalServerNowMs(json),
+    );
+  }
 }
 
 /// A comment line (`: ping`) used as a heartbeat.
@@ -203,7 +228,16 @@ abstract interface class SyncHelloTransport {
 /// Body of a successful SPEC section 3.5 hello (`200`).
 final class HelloResult {
   /// Creates a result from the store origin and the token subject.
-  const HelloResult({required this.origin, required this.userId});
+  ///
+  /// [serverNowMs] is the optional store clock. A `200` body that omits
+  /// the key is still a successful handshake: missing `server_now_ms` is
+  /// not an origin mismatch and is not a network error. The engine
+  /// does not update its offset.
+  const HelloResult({
+    required this.origin,
+    required this.userId,
+    this.serverNowMs,
+  });
 
   /// Origin the store holds after this request (after imprint it equals
   /// the request header).
@@ -213,11 +247,20 @@ final class HelloResult {
   /// on the same store.
   final String userId;
 
+  /// Store Unix milliseconds at this hello, or `null` when the key was
+  /// absent. The application never sets this; the server writes it.
+  final int? serverNowMs;
+
   /// Parses a `200` hello body. Both [origin] and `user_id` are required.
+  ///
+  /// `server_now_ms` is optional. Absence is [null], not an exception:
+  /// origin still imprints, and a client that cannot yet sample time must
+  /// not refuse a store that answered `200`.
   factory HelloResult.fromJson(Map<String, Object?> json) {
     return HelloResult(
       origin: _diffRequireString(json, 'origin'),
       userId: _diffRequireString(json, 'user_id'),
+      serverNowMs: readOptionalServerNowMs(json),
     );
   }
 }
@@ -400,6 +443,28 @@ String _diffRequireString(Map<String, Object?> json, String field) {
 
 int _diffRequireInt(Map<String, Object?> json, String field) {
   final value = json[field];
+  if (value is! int) {
+    throw UlsyncProtocolException(
+      'Expected integer for field: $field',
+      field: field,
+    );
+  }
+  return value;
+}
+
+/// Optional `server_now_ms` on a mail `200` body or live `cursor` JSON.
+///
+/// Missing or JSON `null` is [null]: that is not a handshake failure and
+/// does not update the client's offset. A present non-integer is a
+/// protocol error. The JSON number is an `int` (Unix milliseconds). The
+/// store does not rewrite envelope `last_edited_at_ms`; this field is only
+/// the sample the engine uses to stamp outgoing ranks.
+int? readOptionalServerNowMs(Map<String, Object?> json) {
+  const field = 'server_now_ms';
+  final value = json[field];
+  if (value == null) {
+    return null;
+  }
   if (value is! int) {
     throw UlsyncProtocolException(
       'Expected integer for field: $field',

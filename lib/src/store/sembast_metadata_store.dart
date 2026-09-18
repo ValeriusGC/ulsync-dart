@@ -30,6 +30,14 @@ final _cursors = stringMapStoreFactory.store('ulsync_cursor');
 /// it on first write. Existing version-1 files keep opening.
 final _sourceIds = stringMapStoreFactory.store('ulsync_source_id');
 
+/// Per-user store-clock offset last sampled for a [EntityState.userScope].
+///
+/// A new named store does not bump [_databaseVersion]: there is no
+/// migration, and bumping the layout version would refuse every existing
+/// metadata file. Sembast materializes this store on first write, the
+/// same way as [_sourceIds].
+final _clockOffsets = stringMapStoreFactory.store('ulsync_clock_offset');
+
 /// Key of one entity record.
 ///
 /// Every part is percent-escaped before joining: without it the pairs
@@ -311,6 +319,89 @@ final class SembastMetadataStore {
     return _sourceIds.record(userScope).put(_db, {'sourceId': sourceId});
   }
 
+  /// Offset and sample flag last stored for [userScope], or null before
+  /// the first `server_now_ms`.
+  ///
+  /// This is a library primitive; application code should not call it.
+  /// After [close] + [open] with the same `inMemory` name, a write before
+  /// the next hello must use this offset, not raw device milliseconds.
+  Future<StoredClockOffset?> readClockOffset(String userScope) async {
+    final stored = await _clockOffsets.record(userScope).get(_db);
+    if (stored == null) {
+      return null;
+    }
+    return StoredClockOffset(
+      offsetMs: stored['offsetMs']! as int,
+      sampled: stored['sampled']! as bool,
+    );
+  }
+
+  /// Persists [offsetMs] and, on the first sample only, restamps dirty
+  /// rows of [sourceId].
+  ///
+  /// This is a library primitive; application code should not call it.
+  /// The rewrite and the sample flag share one transaction so a crash
+  /// cannot leave dirty stamps shifted without recording that a sample
+  /// already happened (which would shift them again on the next hello).
+  /// Foreign `source_id`, clean rows, and incoming ranks are not written
+  /// here: last-write-wins on the wire is the envelope the neighbour sent,
+  /// not this device's offset. A later sample passes [rewriteDirty] false.
+  /// [_databaseVersion] stays `1`: this named store is created on first
+  /// put, like `ulsync_source_id`.
+  Future<void> persistClockSample({
+    required String userScope,
+    required String sourceId,
+    required int offsetMs,
+    required bool rewriteDirty,
+  }) {
+    return _db.transaction((txn) async {
+      if (rewriteDirty) {
+        final found = await _entities.find(
+          txn,
+          finder: Finder(
+            filter: Filter.and([
+              Filter.equals('userScope', userScope),
+              Filter.equals('dirty', true),
+            ]),
+          ),
+        );
+        for (final snapshot in found) {
+          final state = _fromMap(snapshot.value);
+          if (state.sourceId != sourceId) {
+            continue;
+          }
+          final editedBefore = state.lastEditedAtMs;
+          final created = state.createdAtMs == editedBefore
+              ? state.createdAtMs + offsetMs
+              : state.createdAtMs;
+          await _entities
+              .record(_entityKeyOf(state))
+              .put(
+                txn,
+                _toMap(
+                  EntityState(
+                    userScope: state.userScope,
+                    entityType: state.entityType,
+                    id: state.id,
+                    part: state.part,
+                    createdAtMs: created,
+                    lastEditedAtMs: editedBefore + offsetMs,
+                    revision: state.revision,
+                    sourceId: state.sourceId,
+                    schemaVersion: state.schemaVersion,
+                    dirty: state.dirty,
+                  ),
+                ),
+              );
+        }
+      }
+      await _clockOffsets.record(userScope).put(txn, {
+        'offsetMs': offsetMs,
+        'sampled': true,
+      });
+    });
+  }
+
   /// Writes [state] and advances the feed cursor in one transaction.
   ///
   /// If [serverSeq] is not greater than the stored cursor, the state is still
@@ -369,4 +460,26 @@ final class SembastMetadataStore {
     await record.put(client, {'serverSeq': serverSeq, 'lastSyncAtMs': atMs});
     return true;
   }
+}
+
+/// Offset from a `server_now_ms` sample, keyed by user scope in the
+/// metadata file.
+///
+/// Not exported from `package:ulsync/ulsync.dart`. After the first sample
+/// [sampled] is true and a later `write` before the next hello uses
+/// [offsetMs], not raw device milliseconds. Layout version stays `1`
+/// because this value lives in a new named store, not a new layout.
+final class StoredClockOffset {
+  /// Creates the persisted sample for one user scope.
+  const StoredClockOffset({required this.offsetMs, required this.sampled});
+
+  /// `server_now_ms − nowMs` at the last sample. Added to outgoing stamps.
+  final int offsetMs;
+
+  /// Whether a store clock sample has already been applied.
+  ///
+  /// Distinguishes "offset 0 because clocks already matched" from "no
+  /// sample yet, stamp raw `nowMs`". A repeat sample must not rewrite
+  /// dirty rows a second time.
+  final bool sampled;
 }

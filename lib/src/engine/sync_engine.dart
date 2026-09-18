@@ -198,6 +198,13 @@ final class WriteOp {
 ///   [SyncConnectionLost] / [SyncConnectionRestored] for the strip; do
 ///   not call [syncOnce] from those events — the engine already does.
 ///
+/// After the first `server_now_ms` sample, outgoing `created_at_ms` /
+/// `last_edited_at_ms` are `nowMs` plus a stored offset so last-write-wins
+/// compares devices in store time. Completeness is still `server_seq`.
+/// JWT expiry and the live silence watchdog stay on `DateTime.now()`:
+/// those are transport lifetimes, not SPEC section 2 ranks. The
+/// application does not pass `nowMs` in production and does not call NTP.
+///
 /// [markChanged] remains as a low-level primitive. The first network
 /// action of each instance is SPEC section 3.5 hello, then the first
 /// [syncOnce] runs [selfCheck]. Protocol, HTTP, cursor, the metadata
@@ -244,6 +251,14 @@ final class UlsyncClient {
   /// or [notifyResumed]. Production keeps the default. Tests pass
   /// [Duration.zero] so a scripted failure does not wait a second.
   ///
+  /// [nowMs] is test-only, the same kind of hatch as [inMemory]. It
+  /// returns Unix milliseconds used to stamp a local edit. Production
+  /// omits it so the engine reads `DateTime.now().millisecondsSinceEpoch`.
+  /// The application must not pass this in a shipping build and must not
+  /// call NTP to invent a better clock: after hello the engine already
+  /// adds the stored store-clock offset. Passing it in product would
+  /// teach every app to design time, which this library exists to hide.
+  ///
   /// [pushBatchLimit] and [pullPageLimit] default to [kSpecBatchLimit].
   /// Tests pass a smaller ceiling to prove a record kit is not split at
   /// the batch edge. Production keeps the default. Values outside
@@ -265,6 +280,7 @@ final class UlsyncClient {
     bool inMemory = false,
     Future<void> Function()? beforePersistIncoming,
     Duration catchUpRetryDelay = const Duration(seconds: 1),
+    int Function()? nowMs,
     int pushBatchLimit = kPushBatchLimit,
     int pullPageLimit = kPullPageLimit,
   }) async {
@@ -284,6 +300,7 @@ final class UlsyncClient {
         databasePath: await resolveMetadataDatabasePath(safeName),
       );
     }
+    final storedClock = await metadataStore.readClockOffset(userScope);
     return UlsyncClient._(
       baseUrl: baseUrl,
       origin: origin,
@@ -295,6 +312,9 @@ final class UlsyncClient {
       transport: transport,
       beforePersistIncoming: beforePersistIncoming,
       catchUpRetryDelay: catchUpRetryDelay,
+      nowMs: nowMs ?? _systemNowMs,
+      clockOffsetMs: storedClock?.offsetMs ?? 0,
+      clockSampled: storedClock?.sampled ?? false,
       pushBatchLimit: pushBatchLimit,
       pullPageLimit: pullPageLimit,
     );
@@ -315,6 +335,9 @@ final class UlsyncClient {
     SyncTransport? transport,
     this.beforePersistIncoming,
     Duration catchUpRetryDelay = const Duration(seconds: 1),
+    required this._nowMs,
+    required this._clockOffsetMs,
+    required this._clockSampled,
     int pushBatchLimit = kPushBatchLimit,
     int pullPageLimit = kPullPageLimit,
   }) : origin = requireUlsyncOrigin(origin),
@@ -382,6 +405,18 @@ final class UlsyncClient {
   /// or [close]. A 4xx ([UlsyncUnauthorized], [UlsyncRequestRejected])
   /// stops the loop: the request is wrong, not "server down".
   final Duration _catchUpRetryDelay;
+
+  /// Test hatch for the device clock. Production uses [_systemNowMs].
+  final int Function() _nowMs;
+
+  /// `server_now_ms − nowMs` at the last sample. Zero before a sample.
+  int _clockOffsetMs;
+
+  /// Whether a store clock sample has already been applied for this file.
+  ///
+  /// First sample rewrites dirty rows of [sourceId]. Later samples update
+  /// [_clockOffsetMs] and must not restamp the queue.
+  bool _clockSampled;
 
   /// Ceiling for one push. Record kits are packed to fit; they are not cut.
   final int _pushBatchLimit;
@@ -691,7 +726,11 @@ final class UlsyncClient {
   /// Shared by [markChanged], [write], and [writeAll] so the public marks cannot
   /// drift. [adapter] is already resolved; this method does not look it up.
   /// [part] is the trimmed cell name; last-write-wins and the send queue
-  /// both key this row, not a neighbour with the same [id].
+  /// both key this row, not a neighbour with the same [id]. After a store
+  /// clock sample the stamp is [_correctedNowMs], not raw device time: a
+  /// fast board must not beat a later real edit. The server does not
+  /// rewrite incoming `last_edited_at_ms`; this method is the only place
+  /// that sets outgoing ranks for a local edit.
   Future<void> _markChangedLocked({
     required String entityType,
     required String id,
@@ -704,7 +743,7 @@ final class UlsyncClient {
       id: id,
       part: part,
     );
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = _correctedNowMs();
     await _store.put(
       EntityState(
         userScope: userScope,
@@ -965,14 +1004,75 @@ final class UlsyncClient {
   }
 
   /// One hello attempt. Sets [_originChecked] only on success or unavailability.
+  ///
+  /// Hello runs outside [_serialized]. A non-null `server_now_ms` is
+  /// applied under the lock after the HTTP returns so dirty restamp cannot
+  /// race a [write] and cannot run during the round-trip.
   Future<void> _runOriginHandshake() async {
     final candidate = _transport;
+    HelloResult? result;
     if (candidate is SyncHelloTransport) {
       // Separate interface; the `is` check does not promote a SyncTransport.
       final helloTransport = candidate as SyncHelloTransport;
-      await helloTransport.hello(origin);
+      result = await helloTransport.hello(origin);
     }
     _originChecked = true;
+    await _applyClockSample(result?.serverNowMs);
+  }
+
+  /// Unix milliseconds used to stamp a local edit.
+  ///
+  /// Before the first `server_now_ms` sample this is [_nowMs]. After a
+  /// sample it is [_nowMs] plus the stored offset so last-write-wins
+  /// compares devices in store time, not by which board runs fast.
+  /// Completeness of sync is still `server_seq`; this value does not hide
+  /// rows. The application does not supply [_nowMs] in production.
+  int _correctedNowMs() {
+    final raw = _nowMs();
+    if (!_clockSampled) {
+      return raw;
+    }
+    return raw + _clockOffsetMs;
+  }
+
+  /// Applies [serverNowMs] under [_serialized] when the value is present.
+  ///
+  /// Must not be called from inside [_serialized]: the lock is not
+  /// re-entrant. Pull ingest and live cursor call
+  /// [_applyClockSampleLocked] instead. Hello and the feed-head probe
+  /// run HTTP outside the lock, then this method.
+  Future<void> _applyClockSample(int? serverNowMs) {
+    if (serverNowMs == null) {
+      return Future<void>.value();
+    }
+    return _serialized(() => _applyClockSampleLocked(serverNowMs));
+  }
+
+  /// Records offset = `serverNowMs − nowMs` and, on the first sample,
+  /// restamps dirty rows of [sourceId].
+  ///
+  /// Caller already holds [_serialized]. HTTP must already have returned.
+  /// A repeat sample updates [_clockOffsetMs] and does not rewrite dirty:
+  /// a queue that was already shifted would jump again. Foreign
+  /// `source_id` and incoming envelopes are not written here — those ranks
+  /// arrived on the wire. [SembastMetadataStore.markDirty] still does not
+  /// change clocks: a self-check that stamped "now" would let a stale
+  /// local copy beat a newer neighbour.
+  Future<void> _applyClockSampleLocked(int? serverNowMs) async {
+    if (serverNowMs == null) {
+      return;
+    }
+    _ensureOpen();
+    final offsetMs = serverNowMs - _nowMs();
+    final firstSample = !_clockSampled;
+    await _store.persistClockSample(
+      userScope: userScope,
+      sourceId: sourceId,
+      offsetMs: offsetMs,
+      rewriteDirty: firstSample,
+    );
+    _clockOffsetMs = offsetMs;
+    _clockSampled = true;
   }
 
   /// Runs [action] after the previous serialized job, even if that job failed.
@@ -1215,6 +1315,7 @@ final class UlsyncClient {
     while (true) {
       _ensureOpen();
       final page = await _transport.pull(since: since, limit: _pullPageLimit);
+      await _applyClockSample(page.serverNowMs);
       if (page.envelopes.length < _pullPageLimit) {
         return page.nextCursor;
       }
@@ -1428,6 +1529,7 @@ final class UlsyncClient {
       );
       final done = await _serialized(() async {
         _ensureOpen();
+        await _applyClockSampleLocked(page.serverNowMs);
         if (page.envelopes.isEmpty) {
           await _advanceCursor(page.nextCursor);
           return true;
@@ -1482,7 +1584,10 @@ final class UlsyncClient {
   /// omitted, the domain is not touched, the cursor still moves, and the
   /// part's metadata is stored so the feed is not replayed forever.
   /// Exchange does not fail: an older build must ignore a slice it does
-  /// not understand.
+  /// not understand. Incoming [Envelope.lastEditedAtMs] is stored as it
+  /// arrived. The local clock offset must not rewrite a neighbour's rank:
+  /// two receivers would otherwise diverge. A stamp in year 2090 still
+  /// advances `server_seq`; completeness is the cursor, not the clock.
   Future<void> _ingest(
     Envelope envelope, {
     required bool countInReport,
@@ -1526,7 +1631,7 @@ final class UlsyncClient {
       }
       await beforePersistIncoming?.call();
     }
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = _nowMs();
     final previousCursor = _appliedCursor;
     await _store.applyIncoming(
       state: EntityState(
@@ -1595,7 +1700,7 @@ final class UlsyncClient {
   /// Memory [_appliedCursor] updates only after a successful write. A live
   /// `cursor` event behind the applied value is a no-op (no [SyncCursorAdvanced]).
   Future<void> _advanceCursor(int serverSeq) async {
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = _nowMs();
     final moved = await _store.writeCursor(userScope, serverSeq, now);
     if (!moved) {
       return;
@@ -1698,7 +1803,8 @@ final class UlsyncClient {
     switch (message) {
       case LiveEnvelope(:final envelope):
         await _ingest(envelope, countInReport: false);
-      case LiveCursor(:final nextCursor):
+      case LiveCursor(:final nextCursor, :final serverNowMs):
+        await _applyClockSampleLocked(serverNowMs);
         await _advanceCursor(nextCursor);
       case LiveHeartbeat():
         break;
@@ -1847,3 +1953,7 @@ Map<String, EntityAdapter<dynamic>> _indexAdapters(
   }
   return map;
 }
+
+/// Device Unix milliseconds. Production default for [UlsyncClient.open]
+/// `nowMs`. Tests inject a closure; applications omit the argument.
+int _systemNowMs() => DateTime.now().millisecondsSinceEpoch;
