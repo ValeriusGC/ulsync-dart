@@ -8,10 +8,14 @@ library;
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:sembast/sembast_memory.dart';
+
 import '../protocol/envelope.dart';
 import '../protocol/errors.dart';
 import '../protocol/origin.dart';
 import '../store/entity_state.dart';
+import '../store/instance_name.dart';
+import '../store/platform/metadata_path.dart';
 import '../store/sembast_metadata_store.dart';
 import '../transport/http_sync_transport.dart';
 import '../transport/sync_transport.dart';
@@ -126,15 +130,30 @@ final class WriteOp {
 
 /// End-to-end last-write-wins client: queue, pull, live, one lock.
 ///
-/// The application records local edits with [write] (mark first, persist
-/// second, same lock) or [writeAll] for one related action that touches
-/// many rows. [markChanged] remains as a low-level primitive. [syncOnce]
-/// and [live] move data. The first network action of each instance is
-/// SPEC section 3.5 hello, then the first [syncOnce] runs [selfCheck].
-/// Protocol, HTTP, cursor, and the send queue stay inside.
+/// Open with [UlsyncClient.open]. The application records local edits with
+/// [write] (mark first, persist second, same lock) or [writeAll] for one
+/// related action that touches many rows. [markChanged] remains as a
+/// low-level primitive. [syncOnce] and [live] move data. The first network
+/// action of each instance is SPEC section 3.5 hello, then the first
+/// [syncOnce] runs [selfCheck]. Protocol, HTTP, cursor, the metadata
+/// engine, and the send queue stay inside.
 final class UlsyncClient {
-  /// Creates a client bound to one user, one device, one origin, and one
-  /// metadata store.
+  /// Opens a client bound to one metadata instance named [name].
+  ///
+  /// [name] is an installation-local label (`phone`, `tablet`), not a
+  /// filesystem path and not [origin]. Two processes that share a name
+  /// share a cursor and a stored `source_id`. The library picks IndexedDB
+  /// on the web and an Application Support file on IO; the application
+  /// does not import `path_provider` and does not write `kIsWeb`.
+  ///
+  /// Pass [inMemory] only in tests. A VM test that resolves a real support
+  /// directory will throw `MissingPluginException` from `path_provider`.
+  /// The in-memory factory type is not part of the public API: this flag
+  /// is the test seam, not a `DatabaseFactory` argument.
+  ///
+  /// After [close], a later [open] with the same [name] reopens that same
+  /// metadata instance. Work offline can mute the live feed and come back
+  /// without caching a filesystem path on the widget.
   ///
   /// [origin] is minted once per application contour in the application
   /// project, never per device, and is sent as `Ulsync-Origin`. Empty or
@@ -145,8 +164,8 @@ final class UlsyncClient {
   /// test doubles ignore the header.
   ///
   /// [baseUrl] and [tokenProvider] are ignored when [transport] is provided;
-  /// they remain required so production and tests share one constructor
-  /// shape. The client still closes [transport] in [close], including a
+  /// they remain required so production and tests share one [open] shape.
+  /// The client still closes [transport] in [close], including a
   /// caller-supplied instance — passing a transport passes close ownership.
   ///
   /// [beforePersistIncoming] is test-only. It runs after
@@ -154,13 +173,63 @@ final class UlsyncClient {
   /// window between the two databases. There is no store interface (triad
   /// plan §13.9); this hook is the seam instead of `@visibleForTesting`,
   /// which would import Flutter into `lib/` and fail the import guard.
-  UlsyncClient({
+  ///
+  /// Throws [ArgumentError] when [name] fails [requireInstanceName], when
+  /// [origin], [userScope], or [sourceId] are empty or illegal, or when
+  /// [adapters] contains a duplicate [EntityAdapter.entityType]. Those
+  /// checks run before the database opens and before the network is touched.
+  static Future<UlsyncClient> open({
+    required String name,
+    required Uri baseUrl,
+    required String origin,
+    required String userScope,
+    required String sourceId,
+    required Future<String?> Function() tokenProvider,
+    required List<EntityAdapter<dynamic>> adapters,
+    SyncTransport? transport,
+    bool inMemory = false,
+    Future<void> Function()? beforePersistIncoming,
+  }) async {
+    final safeName = requireInstanceName(name);
+    requireUlsyncOrigin(origin);
+    _requireNonEmpty(userScope, 'userScope');
+    _requireNonEmpty(sourceId, 'sourceId');
+    _indexAdapters(adapters);
+    final SembastMetadataStore metadataStore;
+    if (inMemory) {
+      metadataStore = await SembastMetadataStore.open(
+        databasePath: safeName,
+        factory: databaseFactoryMemory,
+      );
+    } else {
+      metadataStore = await SembastMetadataStore.open(
+        databasePath: await resolveMetadataDatabasePath(safeName),
+      );
+    }
+    return UlsyncClient._(
+      baseUrl: baseUrl,
+      origin: origin,
+      userScope: userScope,
+      sourceId: sourceId,
+      tokenProvider: tokenProvider,
+      store: metadataStore,
+      adapters: adapters,
+      transport: transport,
+      beforePersistIncoming: beforePersistIncoming,
+    );
+  }
+
+  /// Binds an already-opened metadata store. Applications call [open].
+  ///
+  /// The store field is private: a public [SembastMetadataStore] member
+  /// would leak the engine type even after the class left the barrel.
+  UlsyncClient._({
     required this.baseUrl,
     required String origin,
     required String userScope,
     required String sourceId,
     required this.tokenProvider,
-    required this.store,
+    required this._store,
     required List<EntityAdapter<dynamic>> adapters,
     SyncTransport? transport,
     this.beforePersistIncoming,
@@ -196,7 +265,10 @@ final class UlsyncClient {
   final Future<String?> Function() tokenProvider;
 
   /// Metadata database: cursor, dirty queue, revision. Not entity payloads.
-  final SembastMetadataStore store;
+  ///
+  /// Private so the sembast type cannot leak through a public member after
+  /// the class left the barrel. Applications never see this field.
+  final SembastMetadataStore _store;
 
   /// Adapters keyed by `entity_type`. Lookups use this map, never `dynamic`.
   final Map<String, EntityAdapter<dynamic>> _adapters;
@@ -213,10 +285,10 @@ final class UlsyncClient {
   final Future<void> Function()? beforePersistIncoming;
 
   /// Applied `server_seq`. Read by [SyncTransport.live]'s `appliedSince`
-  /// synchronously — that callback must never call [store.readCursor].
+  /// synchronously — that callback must never call [_store.readCursor].
   int _appliedCursor = 0;
 
-  /// Whether [_appliedCursor] has been loaded from [store] this session.
+  /// Whether [_appliedCursor] has been loaded from [_store] this session.
   bool _cursorLoaded = false;
 
   /// Set by [close]; later mutating calls throw [StateError].
@@ -468,14 +540,14 @@ final class UlsyncClient {
     required EntityAdapter<dynamic> adapter,
     required String part,
   }) async {
-    final existing = await store.stateOf(
+    final existing = await _store.stateOf(
       userScope: userScope,
       entityType: entityType,
       id: id,
       part: part,
     );
     final now = DateTime.now().millisecondsSinceEpoch;
-    await store.put(
+    await _store.put(
       EntityState(
         userScope: userScope,
         entityType: entityType,
@@ -499,11 +571,11 @@ final class UlsyncClient {
   /// supported configuration, not an error. The library calls this once per
   /// client on the first [syncOnce] — an application normally never calls it.
   ///
-  /// When an adapter has no [EntityAdapter.listIds], the local phase reports
-  /// unavailable instead of failing. When [includeServer] is `false`, or the
-  /// transport does not implement [SyncDiffTransport], or the server answers
-  /// 404/405, the server phase reports unavailable. An old server is a
-  /// supported configuration.
+  /// The local phase always invokes [EntityAdapter.listIds]. It reports
+  /// unavailable only when this client has no adapters. When
+  /// [includeServer] is `false`, or the transport does not implement
+  /// [SyncDiffTransport], or the server answers 404/405, the server phase
+  /// reports unavailable. An old server is a supported configuration.
   ///
   /// Marking a row the library already knows **does not change** its edit
   /// time, creation time, or revision. Those are the ranks of SPEC section 2;
@@ -646,7 +718,7 @@ final class UlsyncClient {
       await liveDone;
     }
     await _serialized(() async {});
-    await store.close();
+    await _store.close();
     if (!_events.isClosed) {
       await _events.close();
     }
@@ -732,9 +804,9 @@ final class UlsyncClient {
   /// forever with no later check able to see it (SPEC section 1.4). A
   /// changed id is therefore a loud [StateError], not a log line.
   Future<void> _checkInstallationIdentity() async {
-    final stored = await store.readSourceId(userScope);
+    final stored = await _store.readSourceId(userScope);
     if (stored == null) {
-      await store.writeSourceId(userScope, sourceId);
+      await _store.writeSourceId(userScope, sourceId);
       return;
     }
     if (stored == sourceId) {
@@ -748,19 +820,16 @@ final class UlsyncClient {
     );
   }
 
-  /// Phase 2: application ids vs metadata. Time `0` means unknown age.
+  /// Phase 2: application ids vs metadata. Time `1` means unknown age.
   Future<({bool available, int marked})> _reconcileLocalIds() async {
-    var anyListIds = false;
+    if (_adapters.isEmpty) {
+      return (available: false, marked: 0);
+    }
     var marked = 0;
     for (final adapter in _adapters.values) {
-      final listIds = adapter.listIds;
-      if (listIds == null) {
-        continue;
-      }
-      anyListIds = true;
-      final ids = await listIds();
+      final ids = await adapter.listIds();
       for (final id in ids) {
-        final existing = await store.stateOf(
+        final existing = await _store.stateOf(
           userScope: userScope,
           entityType: adapter.entityType,
           id: id,
@@ -771,7 +840,7 @@ final class UlsyncClient {
         }
         // Unknown to the library. Time 1 is older than any real edit and is
         // legal on the wire (the server rejects 0).
-        await store.put(
+        await _store.put(
           EntityState(
             userScope: userScope,
             entityType: adapter.entityType,
@@ -788,7 +857,7 @@ final class UlsyncClient {
         marked++;
       }
     }
-    return (available: anyListIds, marked: marked);
+    return (available: true, marked: marked);
   }
 
   /// Phase 3: metadata vs server. The server compares; the client only marks.
@@ -816,7 +885,7 @@ final class UlsyncClient {
     // Unrelated to [SyncTransport]; the `is` check does not promote.
     final diffTransport = candidate as SyncDiffTransport;
     final collected = await _serialized(() async {
-      final states = await store.allStates(userScope);
+      final states = await _store.allStates(userScope);
       final types = <String, String>{};
       final probes = <DiffProbe>[];
       for (final row in states) {
@@ -879,7 +948,7 @@ final class UlsyncClient {
         }
         // Clock stays: this is not an edit. Refreshing lastEditedAtMs here
         // would let this device's stale copy win SPEC section 2.
-        final ok = await store.markDirty(
+        final ok = await _store.markDirty(
           userScope: userScope,
           entityType: entityType,
           id: verdict.id,
@@ -914,7 +983,7 @@ final class UlsyncClient {
 
   /// Dirty rows in this [userScope].
   Future<int> _dirtyCount() async {
-    final states = await store.allStates(userScope);
+    final states = await _store.allStates(userScope);
     var n = 0;
     for (final row in states) {
       if (row.dirty) {
@@ -924,12 +993,12 @@ final class UlsyncClient {
     return n;
   }
 
-  /// Loads [_appliedCursor] from [store] once per client lifetime.
+  /// Loads [_appliedCursor] from [_store] once per client lifetime.
   Future<void> _ensureCursorLoaded() async {
     if (_cursorLoaded) {
       return;
     }
-    _appliedCursor = await store.readCursor(userScope);
+    _appliedCursor = await _store.readCursor(userScope);
     _cursorLoaded = true;
   }
 
@@ -963,7 +1032,7 @@ final class UlsyncClient {
     if (local <= head) {
       return;
     }
-    await store.resetCursor(userScope);
+    await _store.resetCursor(userScope);
     _appliedCursor = 0;
   }
 
@@ -991,7 +1060,7 @@ final class UlsyncClient {
   /// new client against a server whose limit is still 1 is a named
   /// incompatibility, and two send paths would drift.
   Future<void> _pushDirty(_SyncCounters counters) async {
-    final batch = await store.dirtyBatch(
+    final batch = await _store.dirtyBatch(
       userScope: userScope,
       limit: kPushBatchLimit,
     );
@@ -1135,7 +1204,7 @@ final class UlsyncClient {
       _emit(SyncUnknownType(entityType: envelope.entityType, id: envelope.id));
       return;
     }
-    final local = await store.stateOf(
+    final local = await _store.stateOf(
       userScope: userScope,
       entityType: envelope.entityType,
       id: envelope.id,
@@ -1162,7 +1231,7 @@ final class UlsyncClient {
     }
     final now = DateTime.now().millisecondsSinceEpoch;
     final previousCursor = _appliedCursor;
-    await store.applyIncoming(
+    await _store.applyIncoming(
       state: EntityState(
         userScope: userScope,
         entityType: envelope.entityType,
@@ -1222,7 +1291,7 @@ final class UlsyncClient {
   /// `cursor` event behind the applied value is a no-op (no [SyncCursorAdvanced]).
   Future<void> _advanceCursor(int serverSeq) async {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final moved = await store.writeCursor(userScope, serverSeq, now);
+    final moved = await _store.writeCursor(userScope, serverSeq, now);
     if (!moved) {
       return;
     }
@@ -1234,7 +1303,7 @@ final class UlsyncClient {
 
   /// Clears dirty only if [row.revision] is still the stored revision.
   Future<void> _clearDirty(EntityState row) {
-    return store.clearDirty(
+    return _store.clearDirty(
       userScope: userScope,
       entityType: row.entityType,
       id: row.id,
