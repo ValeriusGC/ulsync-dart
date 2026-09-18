@@ -156,12 +156,14 @@ void main() {
     final empty = await transport.pull(since: 7);
     expect(empty.envelopes, isEmpty);
     expect(empty.nextCursor, 42);
+    expect(empty.serverNowMs, isNull);
     expect(server.requests[0].query['since'], '7');
     expect(server.requests[0].query.containsKey('limit'), isFalse);
 
     final page = await transport.pull(since: 0, limit: 10);
     expect(page.envelopes, hasLength(1));
     expect(page.nextCursor, 1);
+    expect(page.serverNowMs, 1756100123456);
     expect(server.requests[1].query['since'], '0');
     expect(server.requests[1].query['limit'], '10');
   });
@@ -328,7 +330,10 @@ void main() {
         chunks: [
           _sseEvent('envelope', first),
           _sseEvent('envelope', second),
-          _sseEvent('cursor', '{"next_cursor":2}'),
+          _sseEvent(
+            'cursor',
+            '{"next_cursor":2,"server_now_ms":1756100123456}',
+          ),
         ],
         holdOpen: true,
       ),
@@ -343,6 +348,7 @@ void main() {
     expect((probe.messages[0] as LiveEnvelope).envelope.serverSeq, 1);
     expect((probe.messages[1] as LiveEnvelope).envelope.serverSeq, 2);
     expect((probe.messages[2] as LiveCursor).nextCursor, 2);
+    expect((probe.messages[2] as LiveCursor).serverNowMs, 1756100123456);
   });
 
   test(

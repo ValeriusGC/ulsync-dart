@@ -50,6 +50,7 @@ void main() {
     expect(result, isNotNull);
     expect(result!.origin, _origin);
     expect(result.userId, 'alice');
+    expect(result.serverNowMs, 1756100123456);
     expect(server.requests.single.method, 'GET');
     expect(server.requests.single.path, '/v1/sync/hello');
     expect(server.requests.single.ulsyncOrigin, _origin);

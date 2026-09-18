@@ -397,7 +397,9 @@ final class LiveSession {
           case 'envelope':
             _controller.add(LiveEnvelope(_parseEnvelope(data)));
           case 'cursor':
-            _controller.add(LiveCursor(_parseCursor(data)));
+            _controller.add(
+              LiveCursor.fromJson(_decodeObject(data, 'next_cursor')),
+            );
           default:
             throw UlsyncProtocolException(
               'Unknown live event name: $name',
@@ -409,18 +411,6 @@ final class LiveSession {
 
   Envelope _parseEnvelope(String data) {
     return Envelope.fromJson(_decodeObject(data, 'data'));
-  }
-
-  int _parseCursor(String data) {
-    final map = _decodeObject(data, 'next_cursor');
-    final value = map['next_cursor'];
-    if (value is! int) {
-      throw UlsyncProtocolException(
-        'next_cursor must be an integer',
-        field: 'next_cursor',
-      );
-    }
-    return value;
   }
 
   Map<String, Object?> _decodeObject(String text, String field) {

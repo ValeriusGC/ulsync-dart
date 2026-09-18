@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 15:28:05 +0300  
-**Version:** 21  
+**Updated:** 2026-09-18 21:12:04 +0300  
+**Version:** 22  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -13,6 +13,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- After hello (or pull / live `cursor` with `server_now_ms`), outgoing
+  `last_edited_at_ms` is store time plus the engine’s device offset, so a
+  skewed device no longer wins last-write-wins against a later real edit
+  once both have sampled store time. Completeness stays `server_seq`.
+  The first sample rewrites dirty rows of this installation’s
+  `source_id` only; incoming ranks are stored as they arrived.
+  Intentional clock tampering after a sample is still not promised
+  (proposal §12.1). The application does not call NTP and does not pass
+  `nowMs` in production.
 - With `live()` running, `write` / `writeAll` / `markChanged` schedule
   engine catch-up themselves. The edit future completes after persist: it
   does not wait for HTTP and does not throw `UlsyncNetworkException`.

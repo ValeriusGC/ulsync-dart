@@ -457,7 +457,11 @@ final class HttpSyncTransport
         field: 'next_cursor',
       );
     }
-    return PullPage(envelopes: envelopes, nextCursor: cursor);
+    return PullPage(
+      envelopes: envelopes,
+      nextCursor: cursor,
+      serverNowMs: readOptionalServerNowMs(map),
+    );
   }
 
   /// Parses SPEC section 3.4 `missing` and `stale` arrays. Both must be lists,
