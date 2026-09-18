@@ -1,4 +1,7 @@
 /// Self-check: clock preservation, identity, one-shot run, chunking.
+///
+/// Diff probes for one `id` are an **indivisible** kit and must not split
+/// across the SPEC ceiling of 500.
 library;
 
 import 'dart:convert';
@@ -77,7 +80,7 @@ EntityAdapter<_Memo> _adapter({
       }
       return _Memo(id: id, text: text);
     },
-    apply: (memo) async {
+    apply: (memo, meta) async {
       appStore[memo.id] = memo.text;
     },
     listIds: () async {

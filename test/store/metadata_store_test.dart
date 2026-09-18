@@ -1,4 +1,7 @@
 /// Tests for [SembastMetadataStore] on an in-memory sembast database.
+///
+/// One metadata row is one cell. The engine packs those cells into
+/// **indivisible, complete** record kits at push time.
 library;
 
 import 'package:flutter_test/flutter_test.dart';
@@ -158,6 +161,15 @@ void main() {
     }
     final batch = await store.dirtyBatch(userScope: 'alice', limit: 2);
     expect(batch, hasLength(2));
+  });
+
+  test('allDirty returns every dirty row oldest first', () async {
+    final store = await openMemoryStore();
+    await store.put(sampleState(id: 'b', lastEditedAtMs: 30, dirty: true));
+    await store.put(sampleState(id: 'a', lastEditedAtMs: 10, dirty: true));
+    await store.put(sampleState(id: 'clean', dirty: false));
+    final dirty = await store.allDirty('alice');
+    expect(dirty.map((s) => s.id), ['a', 'b']);
   });
 
   test('dirtyBatch never returns another userScope', () async {

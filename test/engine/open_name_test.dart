@@ -35,7 +35,7 @@ void main() {
               encode: (text) => throw StateError('unused'),
               decode: (bytes, schemaVersion) => throw StateError('unused'),
               load: (id) async => null,
-              apply: (value) async {},
+              apply: (value, meta) async {},
               listIds: () async => const [],
             ),
           ],

@@ -2,6 +2,8 @@
 ///
 /// A related edit must not leave on the wire until every persist finished.
 /// A drain of the dirty queue must not clear marks before the POST returns.
+/// A record kit (`full` plus named parts of one id) is **indivisible**: the
+/// SPEC ceiling of 500 must not cut it in half.
 library;
 
 import 'dart:async';
@@ -145,7 +147,7 @@ final class _NoteHarness {
             }
             return _Memo(id: id, text: text);
           },
-          apply: (memo) async {
+          apply: (memo, meta) async {
             appStore[memo.id] = memo.text;
           },
           listIds: () async => appStore.keys.toList(growable: false),
@@ -206,7 +208,7 @@ final class _TaskHarness {
   final Map<String, _Task> domain;
 
   /// Opens a three-column task client.
-  static Future<_TaskHarness> open() async {
+  static Future<_TaskHarness> open({int pushBatchLimit = 500}) async {
     final factory = databaseFactoryMemory;
     final path = 'write_all_tasks_${_pathCounter++}';
     await factory.deleteDatabase(path);
@@ -227,7 +229,7 @@ final class _TaskHarness {
           encode: (task) => _fullBytes(id: task.id, title: task.title),
           decode: (bytes, schemaVersion) => _taskFromFull(bytes),
           load: (id) async => domain[id],
-          apply: (task) async {
+          apply: (task, meta) async {
             final row = domain.putIfAbsent(task.id, () => _Task(id: task.id));
             row.title = task.title;
           },
@@ -246,7 +248,7 @@ final class _TaskHarness {
                 return null;
             }
           },
-          applyPart: (id, part, payload) async {
+          applyPart: (id, part, payload, meta) async {
             final row = domain.putIfAbsent(id, () => _Task(id: id));
             switch (part) {
               case 'done':
@@ -259,6 +261,7 @@ final class _TaskHarness {
       ],
       transport: fake,
       inMemory: true,
+      pushBatchLimit: pushBatchLimit,
     );
     addTearDown(() async {
       await client.close();
@@ -360,6 +363,54 @@ void main() {
       expect(h.fake.pushCalls.single.map((e) => e.id).toSet(), {'t1'});
       expect(report.pushed, 3);
       expect(report.accepted, 3);
+    },
+  );
+
+  test(
+    'push keeps full and done of one id together under the batch ceiling',
+    () async {
+      final h = await _TaskHarness.open(pushBatchLimit: 3);
+      await h.client.write<void>(
+        entityType: 'task',
+        id: 't1',
+        persist: () async {
+          h.domain['t1'] = _Task(id: 't1', title: 'One');
+        },
+      );
+      await h.client.write<void>(
+        entityType: 'task',
+        id: 't2',
+        persist: () async {
+          h.domain['t2'] = _Task(id: 't2', title: 'Two');
+        },
+      );
+      await h.client.write<void>(
+        entityType: 'task',
+        id: 't3',
+        persist: () async {
+          h.domain['t3'] = _Task(id: 't3', title: 'Three');
+        },
+      );
+      await h.client.write<void>(
+        entityType: 'task',
+        id: 't1',
+        part: 'done',
+        persist: () async {
+          h.domain['t1']!.done = true;
+        },
+      );
+
+      await h.client.syncOnce();
+      expect(h.fake.pushCalls, hasLength(1));
+      expect(h.fake.pushCalls.single.map((e) => '${e.id}:${e.part}'), [
+        't1:full',
+        't1:done',
+        't2:full',
+      ]);
+
+      await h.client.syncOnce();
+      expect(h.fake.pushCalls, hasLength(2));
+      expect(h.fake.pushCalls[1].map((e) => '${e.id}:${e.part}'), ['t3:full']);
     },
   );
 

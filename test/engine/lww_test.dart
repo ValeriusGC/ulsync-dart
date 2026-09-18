@@ -1,4 +1,7 @@
 /// Last-write-wins UTF-8 ranking, including cases [String.compareTo] misses.
+///
+/// Ranks compare one `(id, part)` cell. They never mark a record kit
+/// complete because `full` tied: `done` and `deleted` still apply.
 library;
 
 import 'package:flutter_test/flutter_test.dart';
@@ -16,6 +19,34 @@ void main() {
         localSourceId: 'a',
       ),
       isFalse,
+    );
+  });
+
+  test('equal tuples are not stale', () {
+    expect(
+      incomingIsStale(
+        incomingLastEditedAtMs: 1,
+        incomingRevision: 1,
+        incomingSourceId: 'a',
+        localLastEditedAtMs: 1,
+        localRevision: 1,
+        localSourceId: 'a',
+      ),
+      isFalse,
+    );
+  });
+
+  test('older time is stale even with a higher revision', () {
+    expect(
+      incomingIsStale(
+        incomingLastEditedAtMs: 1,
+        incomingRevision: 9,
+        incomingSourceId: 'z',
+        localLastEditedAtMs: 2,
+        localRevision: 1,
+        localSourceId: 'a',
+      ),
+      isTrue,
     );
   });
 
