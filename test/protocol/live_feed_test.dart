@@ -34,6 +34,7 @@ void main() {
 
     final cursorData = jsonDecode(cursorEvent.data) as Map<String, Object?>;
     expect(cursorData['next_cursor'], 1);
+    expect(cursorData['server_now_ms'], 1756100123456);
 
     expect(items[2], isA<LiveFeedHeartbeat>());
   });

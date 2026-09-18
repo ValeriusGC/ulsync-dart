@@ -23,6 +23,12 @@ final class FakeHelloTransport
   /// Optional hello script. When omitted, returns a matching [HelloResult].
   Future<HelloResult?> Function(String origin)? onHello;
 
+  /// Store clock included on default hello / pull when the test sets it.
+  ///
+  /// [onHello] / [onPull] override this. Absence keeps [HelloResult.serverNowMs]
+  /// and [PullPage.serverNowMs] null so existing handshake tests stay raw.
+  int? serverNowMs;
+
   /// Push invocations; round 1 sends one envelope per call.
   final List<List<Envelope>> pushCalls = [];
 
@@ -44,6 +50,12 @@ final class FakeHelloTransport
   /// How many times [live] was opened.
   int liveCalls = 0;
 
+  /// Engine cursor callback captured by the last [live] call.
+  int Function()? appliedSince;
+
+  /// Connection-state callback captured by the last [live] call.
+  void Function(LiveConnectionState state)? onConnectionState;
+
   /// Live messages. Broadcast so [close] does not hang when nobody listened.
   final StreamController<LiveMessage> liveController =
       StreamController<LiveMessage>.broadcast();
@@ -60,7 +72,11 @@ final class FakeHelloTransport
     if (handler != null) {
       return handler(origin);
     }
-    return HelloResult(origin: origin, userId: 'alice');
+    return HelloResult(
+      origin: origin,
+      userId: 'alice',
+      serverNowMs: serverNowMs,
+    );
   }
 
   @override
@@ -87,7 +103,11 @@ final class FakeHelloTransport
     if (handler != null) {
       return handler(since: since, limit: limit);
     }
-    return PullPage(envelopes: const [], nextCursor: since);
+    return PullPage(
+      envelopes: const [],
+      nextCursor: since,
+      serverNowMs: serverNowMs,
+    );
   }
 
   @override
@@ -110,6 +130,8 @@ final class FakeHelloTransport
     _ensureOpen();
     callOrder.add('live');
     liveCalls++;
+    this.appliedSince = appliedSince;
+    this.onConnectionState = onConnectionState;
     return liveController.stream;
   }
 

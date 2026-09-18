@@ -22,6 +22,9 @@ final class FakeSyncTransport implements SyncTransport {
   /// Optional pull script. When omitted, the page is empty at [since].
   Future<PullPage> Function({required int since, int? limit})? onPull;
 
+  /// Store clock included on the default empty pull when the test sets it.
+  int? serverNowMs;
+
   /// Invoked at the start of every [push], before the envelope list is stored.
   ///
   /// Used to detect a push that sneaks in while [UlsyncClient.write]'s persist
@@ -80,7 +83,11 @@ final class FakeSyncTransport implements SyncTransport {
     if (handler != null) {
       return handler(since: since, limit: limit);
     }
-    return PullPage(envelopes: const [], nextCursor: since);
+    return PullPage(
+      envelopes: const [],
+      nextCursor: since,
+      serverNowMs: serverNowMs,
+    );
   }
 
   @override
