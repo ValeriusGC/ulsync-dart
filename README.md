@@ -1,7 +1,7 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 09:57:05 +0300  
+**Updated:** 2026-09-18 13:21:00 +0300  
 **Version:** 17  
 **Document type:** readme
 
@@ -20,6 +20,28 @@ without sharing a package name.
   its own metadata database, separate from the application's own storage.
 - Does not invent a custom merge for the application — round 1 is mechanical
   last-write-wins on the envelope.
+
+## Record kits (indivisible and complete)
+
+A **record kit** is every envelope of one `(entityType, id)`: `full` plus
+every named part (`done`, `deleted`, or any other name the app chooses).
+That kit is **indivisible** and must be **complete**.
+
+**Complete.** The application row is the union of every cell. `full` is
+one cell (snapshot columns), not the whole record. Applying `full` does
+not finish the id. No cell may be skipped because metadata “already
+knows” the ranks, because `full` already created a domain row, or because
+a later slice looks optional.
+
+**Indivisible.** Push, pull, and diff never cut a kit at the SPEC ceiling
+of 500. A POST may be shorter than 500 so `full` and `done` of one id
+travel together. A full pull page holds the trailing id so the rest of
+that kit arrives with it. Diff probes for one `id` stay in one request.
+Filling a quota by dropping the rest of a kit is forbidden.
+
+Last-write-wins still compares inside one `(id, part)` only. That is how
+a newer local `done` is not overwritten by an older `done`. It is not
+permission to drop `done` after `full`.
 
 ## Status
 
@@ -49,7 +71,9 @@ covers one related action that touches many rows; `markChanged`
 remains as a low-level primitive (see **Recording a local edit** below).
 The first network call of each client is an origin handshake
 (see **Origin**); the library then runs a self-check once on the first
-`syncOnce` (see **Self-check**).
+`syncOnce` (see **Self-check**). Record kits are **indivisible** and
+must be **complete** (see **Record kits**): `full` plus every named
+part of one id travel and apply together.
 
 ```dart
 import 'dart:convert';
@@ -70,7 +94,7 @@ final client = await UlsyncClient.open(
       encode: (op) => utf8.encode(jsonEncode(op.toJson())),
       decode: (bytes, schemaVersion) => CounterOperation.fromJson(...),
       load: (String id) async => localOpLog.byId(id),
-      apply: (op) async => localOpLog.upsert(op),
+      apply: (op, meta) async => localOpLog.upsert(op, editedAtMs: meta.lastEditedAtMs),
       listIds: () async => localOpLog.allIds(),
     ),
   ],
@@ -85,6 +109,8 @@ final result = await client.syncOnce();
 final subscription = client.live().listen((event) {
   // Update the screen from SyncEvent. Do not parse envelopes.
 });
+// Flutter cannot be imported from lib/. On AppLifecycleState.resumed:
+// await client.notifyResumed();
 ```
 
 `10.0.2.2` is the host loopback as seen from an Android emulator. On a
@@ -281,14 +307,16 @@ await client.writeAll([
 ]);
 ```
 
-The send queue then posts up to 500 dirty rows in **one**
-`POST /v1/sync/push`. A hundred-row related edit therefore leaves in
-one request. Unrelated taps may still leave on later `syncOnce`
-passes when more than 500 rows are dirty; that is not a defect. An
-older server whose limit is still 1 answers HTTP 413 for a batch
-longer than one. The library does not retry that failure as
-single-envelope POSTs — a named cost of talking to a round-1 server,
-not a second send path.
+The send queue then posts complete **record kits** in one
+`POST /v1/sync/push` — every dirty cell of one id (`full`, `done`,
+`deleted`, …) travels together. The SPEC ceiling is 500 envelopes;
+the library will send fewer than 500 rather than cut a kit in half
+and leave the rest for a later request. Unrelated records may still
+leave on a later `syncOnce` when more than 500 **complete kits** are
+dirty; that is not a defect. An older server whose limit is still 1
+answers HTTP 413 for a batch longer than one. The library does not
+retry that failure as single-envelope POSTs — a named cost of talking
+to a round-1 server, not a second send path.
 
 `markChanged` stays in the public API. It is a **low-level primitive**
 for applications that cannot persist through the library. Calling it
@@ -303,12 +331,34 @@ runs the self-check.
 
 ## Named parts
 
+See **Record kits (indivisible and complete)** above. This section is the
+adapter contract for those cells.
+
 An envelope is one cell: identity on the wire is `(id, part)`, not
-`id` alone. `full` is the complete snapshot of the record. Any other
-non-empty string is a slice the **application** names. The library
-does not keep a registry of those names, does not know “trash”, and
-does not treat `done` or `deleted` as reserved protocol values — those
-two strings are examples an app may choose, nothing more.
+`id` alone. `full`, `done`, `deleted`, and every other name are
+**equal**. The complete application record is the **union** of every
+cell for that id. `full` is the default write part for snapshot
+columns (title, body). It is not a privileged envelope that finishes
+the row, and it does not outrank a later or earlier slice.
+
+The engine always considers the whole set, in the order those cells
+were created. Pull and live ingest every envelope; last-write-wins
+compares inside one `(id, part)` pair only and never drops `done`
+because `full` already created a domain row. A three-rank **tie**
+still applies. The only skip is a **strictly older** version of the
+**same** cell.
+
+Push, pull, and diff **must not** cut a record kit at the SPEC batch
+ceiling of 500. Completeness and indivisibility are the same law: a
+POST that would need 501 envelopes keeps the last incomplete id for
+the next request. A full pull page holds the trailing `(entityType,
+id)` so `full` and `done` that straddle the page arrive together.
+Diff probes for one `id` stay in one request.
+
+The library does not keep a registry of part names, does not know
+“trash”, and does not treat `done` or `deleted` as reserved protocol
+values — those two strings are examples an app may choose, nothing
+more.
 
 Last-write-wins already compares inside one `(id, part)` pair and
 does not jump to a neighbour. That is not enough in the domain. The
@@ -396,7 +446,9 @@ Three phases, in order:
    nothing, not that the phase is off.
 3. **Library metadata vs the server.** `POST /v1/sync/diff` (SPEC
    section 3.4) sends `(id, part)` plus the **three** ranks of SPEC
-   section 2, in batches of 500. The server answers `missing` (no row)
+   section 2, in batches of at most 500 **complete ids**. Probes for
+   one `id` are never split across two requests. The server answers
+   `missing` (no row)
    and `stale` (its row loses). The client does not compare ranks; it
    marks the named keys **without changing** edit time, creation time,
    or revision, then pushes through the ordinary queue. A server that
@@ -427,11 +479,13 @@ Listen to `live()` for `SyncEvent` values:
 
 - `SyncApplied` / `SyncCursorAdvanced` — refresh the screen from the
   application store; the payload is already in `apply`.
-- `SyncConnectionLost` — show a disconnected state. Do not parse the
-  protocol. The library reopens the feed on its own.
-- `SyncConnectionRestored` — clear that state. After returning from
-  background, still call `syncOnce`: the OS may have killed the socket
-  in a way that looks like a clean close (see Limitations).
+- `SyncConnectionLost` — show reconnecting. Do not parse the protocol
+  and do not call `syncOnce` from this event: the engine already
+  reopens the feed and retries catch-up. After lock-screen or laptop
+  sleep, still call `notifyResumed` — this event cannot fire while the
+  isolate is frozen.
+- `SyncConnectionRestored` — clear disconnected UI. The engine retries
+  `syncOnce` until push/pull succeed.
 - `SyncUnknownType` — log it; sync of known types continues.
 
 The application does not store the cursor or the send queue. Those live
@@ -439,8 +493,8 @@ in the library metadata file the `name` argument selects.
 
 ## Limitations of round 1
 
-- The send queue posts up to 500 envelopes in one `POST /v1/sync/push`
-  (the SPEC maximum, so a hundred-row related edit is one request). An
+- The send queue posts complete record kits in one `POST /v1/sync/push`
+  (SPEC maximum 500; a kit is never cut to fill that number). An
   older server whose limit is still 1 answers HTTP 413 for a longer
   batch. The library does not turn that into per-envelope POSTs.
 - Dirty marks for a posted batch are cleared only after that POST
@@ -449,17 +503,18 @@ in the library metadata file the `name` argument selects.
   the library does not interpret. `flags` stay `0`.
 - No payload compression, no clock-skew correction, no content schema
   migrations inside the library.
-- The library does not call `syncOnce` on a timer. The application knows
-  foreground, battery, and connectivity.
-- `syncOnce` does not retry HTTP `5xx` or network errors. It throws and
-  leaves `dirty` set so the application can call `syncOnce` again.
+- The library does not call `syncOnce` on a timer for battery. After
+  `live()` starts, drop, 5xx, and TCP death are retried by the engine
+  until `close()`. A frozen isolate (app switcher, laptop sleep) is
+  **not** visible inside `lib/` (Flutter import is forbidden). Call
+  `UlsyncClient.notifyResumed` from `AppLifecycleState.resumed`.
+- `syncOnce` itself does not retry HTTP `5xx` or network errors: it
+  throws and leaves `dirty` set. `notifyResumed` and live restore wrap
+  it in a retry loop.
 - `applied: false` is success: the server already holds a row that is
   not inferior. The engine clears `dirty` on both `true` and `false`.
   Retrying a rejected envelope loops forever because the upsert requires
   a strictly superior tuple.
-- A live socket closed by the OS in the background is caught up by an
-  ordinary `syncOnce` when the application returns to the foreground.
-  That is the same limit PowerSync and PocketBase document.
 - The `example/` app is not promised against a local server from Chrome:
   `ulsync-server` does not send CORS headers. Use macOS or an Android
   emulator.
@@ -487,6 +542,24 @@ and when opening the live feed:
 
 The server is never modified by this step. Sign out and a fresh metadata file
 are still required when changing accounts (`userScope`).
+
+**Auto-heal (domain behind metadata).** The metadata file can survive a
+process restart or an application that clears its in-memory store on sign-in
+while keeping the same `name`. The cursor may already match the server feed
+head, so `pull` would return nothing while [`EntityAdapter.load`] is `null`
+for rows the library still remembers. On every [`syncOnce`](lib/src/engine/sync_engine.dart)
+the engine resets the cursor to `0` when any stored cell (`full` or a
+named part) has no loaded application record and replays the feed. Ingest
+skips only a strictly older version of the same `(id, part)`: a three-rank
+tie still calls [`EntityAdapter.apply`](lib/src/engine/entity_adapter.dart)
+/ [`applyPart`](lib/src/engine/entity_adapter.dart) so `done` and `deleted`
+hydrate after `full` recreates a blank row. Apply must stay idempotent.
+
+**Live reconnect.** When the live transport reports
+[`SyncConnectionRestored`](lib/src/engine/sync_event.dart), the engine runs
+one `syncOnce` and reopens the feed if the stream ended without [`close`].
+
+The server is never modified by these steps.
 
 **What is not stored:** entity payloads (the application adapter supplies
 content at push time), bearer tokens, or any user identifier beyond the
