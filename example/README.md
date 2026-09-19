@@ -1,8 +1,8 @@
 # ulsync example — self-hosted to-do list
 
 **Created:** 2026-09-17 17:05:37 +0300  
-**Updated:** 2026-09-18 17:58:19 +0300  
-**Version:** 5  
+**Updated:** 2026-09-19 16:38:40 +0300  
+**Version:** 9  
 **Document type:** readme
 
 ## What this is
@@ -135,6 +135,11 @@ mute is meant to hold back.
 While Work offline is on, the strip shows **Offline · saved on this device**.
 That text must not appear when the store is merely unreachable.
 
+On macOS two-window runs, focusing a muted window still fires
+`AppLifecycleState.resumed`. This sample **always** forwards that to
+`notifyResumed`. The engine does **not** push or pull until `live()` has
+been started — isolate wake is not mute-exit.
+
 ## Store unreachable
 
 Both windows stay signed in. **Stop the `ulsync-server` process** you started
@@ -147,6 +152,25 @@ same server binary on the **same port** with the **same store database**; both
 windows converge without Cmd+Q, without the cloud, and without a Retry
 button. The engine catch-up you proved in step 34 does the work.
 
+## Clocks
+
+Last-write-wins still ranks `last_edited_at_ms` on the wire. After hello (or
+pull / live `cursor` with the same field), the **engine** stamps outgoing edits
+from `server_now_ms` — not from NTP and not from a clock you pass into
+`UlsyncClient.open`. This sample does **not** call an NTP package, does **not**
+expose a “simulate clock skew” control, and does **not** ask you to change
+macOS **Date & Time** to prove round 4. Two windows on one Mac share one OS
+clock anyway; that is not two devices with different boards.
+
+Do **not** pass `nowMs` in production `open` — it is a test hatch, like
+`inMemory`. Row ids here still use `DateTime.now().microsecondsSinceEpoch` for
+uniqueness; that is identity, not LWW rank. The engine owns edit stamps.
+
+**Product proof** for skewed device time is
+`test/engine/clock_offset_test.dart` in the package (frozen names from step
+38). **Regression proof** on this UI is L1–L2 below: `server_now_ms` on the
+wire must not break live exchange or Work-offline mute.
+
 ## Trash and batch
 
 - **Trash** on a row writes part `deleted` (row stays in the map; hidden from
@@ -156,12 +180,91 @@ button. The engine catch-up you proved in step 34 does the work.
 - **Move done to trash** sends every done, visible row in one `writeAll` — not
   a loop of `write`.
 
-## Manual acceptance (K1–K6)
+## Manual acceptance (L1–L2, round 4)
+
+Round 4 on **this example** proves live exchange and mute still work after
+`server_now_ms` ships on hello. Use server `http://127.0.0.1:8080`, device
+names `phone` and `tablet`, JWT from `/tmp/mint_dev_jwt.go` with secret
+`local-dev-only`. **Do not change macOS system clock.** Build and two windows
+as in **Build and open two windows** above; both must reach
+`Live · 127.0.0.1:8080` before you act.
+
+### Terminals for L1–L2
+
+| Label | What it is | What runs there |
+|-------|------------|-----------------|
+| **Terminal A** | Shell tab #1 | `ulsync-server` — leave running |
+| **Terminal B** | Shell tab #2 | Mint JWT, hello gate, `flutter build`, `open -n` |
+| **App · phone** | First app window | Sign in as device `phone`; L1/L2 actions on phone |
+| **App · tablet** | Second app window | Sign in as device `tablet`; watch remote updates |
+
+Order: **Terminal A** up → **Terminal B** (gate + build) → **App · phone** /
+**App · tablet** sign-in → UI steps on the apps.
+
+Use the same `ORIGIN` string the example sends on every request (see
+`kUlsyncOrigin` in `example/lib/main.dart`). Hello takes it in the
+**`Ulsync-Origin` header**, not as a query parameter. `user_id` in the JSON
+body is the JWT subject (`alice` from the mint script), not `user_scope=…` in
+the URL.
+
+### Gate before L1 — hello must carry `server_now_ms` (Terminal B)
+
+**Precondition:** Terminal A shows the server listening on `127.0.0.1:8080`.
+Build the binary from `ulsync-server` `main` **after** round-4 step 37 is
+merged (`go build -o /tmp/ulsync-server-r4 ./cmd/ulsync-server`).
+
+In **Terminal B**:
+
+```bash
+cd /path/to/ulsync-server
+export TOKEN=$(go run /tmp/mint_dev_jwt.go)
+export ORIGIN='com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f'
+```
+
+Optional — if the gate below fails, print the raw body and HTTP status (still
+Terminal B; server stays up in A):
+
+```bash
+curl -sS -w "\nHTTP %{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Ulsync-Origin: $ORIGIN" \
+  http://127.0.0.1:8080/v1/sync/hello
+```
+
+**Gate** (Terminal B):
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  -H "Ulsync-Origin: $ORIGIN" \
+  http://127.0.0.1:8080/v1/sync/hello \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'server_now_ms' in d, d; assert d.get('origin')=='com.example.app/7c3e9a12-4b56-4d8e-9f01-2a3b4c5d6e7f', d; assert d.get('user_id')=='alice', d; print('server_now_ms', d['server_now_ms'])"
+```
+
+| Outcome | Meaning |
+|---------|---------|
+| **Success** | Prints `server_now_ms` followed by an integer. Proceed to build two app windows (Terminal B) and run L1. |
+| `{"error":"origin_required"}` and HTTP 400 | Missing or empty **`Ulsync-Origin`** header — do not put origin in the query string. |
+| HTTP 401 | Bad or expired token — re-run `export TOKEN=$(go run /tmp/mint_dev_jwt.go)`. |
+| HTTP 200 but assert fails on `server_now_ms` | Process on `:8080` is an **old** server binary — rebuild step-37+ server in Terminal A. |
+| Connection refused | Nothing listening — start Terminal A first. |
+
+| Code | Where | Success | Failure |
+|------|-------|---------|---------|
+| L1 | **App · phone** + **App · tablet** both Live. **App · phone:** add **Milk** | **Milk** on **App · tablet** without Cmd+Q, Work offline, or a sync button | `server_now_ms` broke the live feed |
+| L2 | **App · phone:** Work offline → add **While muted** → Online. **App · tablet:** stays Live | After Online both apps converge; **App · phone** list **not** wiped | Mute pushed while offline, journal lost, or restart needed |
+
+Full step-by-step (every terminal labeled): TEMP_39_example_clock.md **Hands**.
+
+L1 is **not** “shift the OS clock”. L2 is **not** “install NTP”. Skewed-device
+LWW is **not** proven on two Mac windows — see `clock_offset_test.dart`.
+
+## Manual acceptance (K1–K6, round 3 regression)
 
 Round 3 on **this example** means the hands checks in the step-35 TEMP
 handoff. Use server `http://127.0.0.1:8080`, device names `phone` and
 `tablet`, JWT from `/tmp/mint_dev_jwt.go` with secret `local-dev-only`. Stop
-and restart the **server process** for outage — not airplane mode.
+and restart the **server process** for outage — not airplane mode. K1–K6 are
+unchanged from round 3; they are **not** about OS clock or NTP.
 
 ### What the list UI can do
 

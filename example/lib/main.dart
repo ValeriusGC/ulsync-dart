@@ -121,10 +121,16 @@ final class _TodosRootPageState extends State<TodosRootPage>
 
   /// Forwards a process wake to [UlsyncClient.notifyResumed].
   ///
-  /// Lock screen, app switcher, and laptop sleep freeze the isolate.
-  /// Live reconnect and the 45s silence watchdog do not run until Dart
-  /// timers fire again. The engine owns catch-up after that call; this
-  /// widget does not call [UlsyncClient.syncOnce] here.
+  /// Lock screen, app switcher, laptop sleep, and macOS window focus freeze
+  /// or refocus the isolate. Live reconnect and the 45s silence watchdog
+  /// do not run until Dart timers fire again. The engine owns catch-up
+  /// after that call when [UlsyncClient.live] is running; this widget does
+  /// not call [UlsyncClient.syncOnce] here.
+  ///
+  /// Work offline is `close` + [UlsyncClient.open] without [live]. The
+  /// engine must not push or pull on isolate wake in that state — focusing
+  /// this window is not mute-exit. The application still reports resume;
+  /// mute is the library's threshold, not a skipped lifecycle call.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) {
@@ -206,6 +212,11 @@ final class _TodosRootPageState extends State<TodosRootPage>
   }
 
   /// Opens sync for [_deviceName] after pairing.
+  ///
+  /// Production [UlsyncClient.open] omits the test-only `nowMs` argument.
+  /// Passing a clock here would teach the next author that time is their
+  /// problem. The engine samples `server_now_ms` on hello and keeps the offset
+  /// in metadata — not in this widget.
   ///
   /// The device name is both the library [UlsyncClient.open] instance label
   /// and [sourceId] for this window. The library picks IndexedDB on the web
