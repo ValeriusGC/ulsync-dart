@@ -698,6 +698,8 @@ void main() {
       }
       return PullPage(envelopes: const [], nextCursor: since);
     };
+    h.client.live().listen((_) {});
+    await _pumpUntil(() => h.fake.appliedSince != null);
 
     await h.client.notifyResumed();
 

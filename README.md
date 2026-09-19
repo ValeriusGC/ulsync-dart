@@ -1,8 +1,8 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 21:12:04 +0300  
-**Version:** 19  
+**Updated:** 2026-09-19 16:38:40 +0300  
+**Version:** 20  
 **Document type:** readme
 
 ## What this is
@@ -360,10 +360,12 @@ pull what mute is meant to hold back). Leaving mute is `syncOnce` then
 and is not OS airplane mode.
 
 `notifyResumed` is still required when the **process** wakes
-(`AppLifecycleState.resumed`). `lib/` does not import Flutter, so the
-engine cannot see isolate sleep; a half-open socket can look healthy
-until the application reports a wake. That kick is not a network
-detector.
+(`AppLifecycleState.resumed`), including macOS window focus. `lib/`
+does not import Flutter, so the engine cannot see isolate sleep; a
+half-open socket can look healthy until the application reports a wake.
+That kick is not a network detector and **not** mute-exit: without a
+prior `live()`, `notifyResumed` pokes the (absent) live socket and does
+not push or pull. Explicit `syncOnce` remains the only mail while muted.
 
 ## Clocks
 
@@ -568,10 +570,11 @@ in the library metadata file the `name` argument selects.
 - The library does not call `syncOnce` on a timer for battery. After
   `live()` starts, a local `write` schedules catch-up, and drop, 5xx,
   and TCP death are retried by the engine until `close()`. A frozen
-  isolate (app switcher, laptop sleep) is **not** visible inside `lib/`
-  (Flutter import is forbidden). Call `UlsyncClient.notifyResumed` from
-  `AppLifecycleState.resumed`. That is isolate wake, not a network
-  detector.
+  isolate (app switcher, laptop sleep, window focus) is **not** visible
+  inside `lib/` (Flutter import is forbidden). Call
+  `UlsyncClient.notifyResumed` from `AppLifecycleState.resumed`. That is
+  isolate wake, not a network detector, and not mute-exit: if `live()`
+  never started, the engine does not push or pull.
 - `syncOnce` itself does not retry HTTP `5xx` or network errors: it
   throws and leaves `dirty` set. Catch-up after `write` (when live is
   running), `notifyResumed`, and live restore wrap it in a retry loop.

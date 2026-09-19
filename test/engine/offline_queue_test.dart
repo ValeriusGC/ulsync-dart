@@ -528,6 +528,35 @@ void main() {
     expect((await h.stateOf('e1'))!.dirty, isTrue);
   });
 
+  test('live not started: notifyResumed does not push or pull', () async {
+    final h = await _Harness.open();
+    await h.writeNote('e1', 'Milk');
+    expect(h.fake.pushCalls, isEmpty);
+    expect(h.fake.pullCalls, isEmpty);
+    await h.client.notifyResumed();
+    for (var i = 0; i < 40; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    expect(h.fake.pushCalls, isEmpty);
+    expect(h.fake.pullCalls, isEmpty);
+    expect((await h.stateOf('e1'))!.dirty, isTrue);
+    expect(h.fake.pokeLiveCalls, 1);
+  });
+
+  test(
+    'live not started: explicit syncOnce still drains after notifyResumed',
+    () async {
+      final h = await _Harness.open();
+      await h.writeNote('e1', 'Milk');
+      await h.client.notifyResumed();
+      expect(h.fake.pushCalls, isEmpty);
+      await h.client.syncOnce();
+      expect(h.fake.pushCalls, isNotEmpty);
+      expect(h.fake.pushCalls.single.single.id, 'e1');
+      expect((await h.stateOf('e1'))!.dirty, isFalse);
+    },
+  );
+
   test(
     'SyncConnectionRestored drains queued writes without the test calling syncOnce',
     () async {

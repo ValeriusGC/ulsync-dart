@@ -52,9 +52,9 @@ abstract interface class SyncTransport {
   ///
   /// A process that was suspended (lock screen, app switcher, laptop sleep)
   /// does not fire the silence watchdog. TCP can look healthy until the OS
-  /// notices. [UlsyncClient.notifyResumed] calls this, then [syncOnce].
-  /// A transport with no live session is a no-op. Does not complete the
-  /// outward live stream.
+  /// notices. [UlsyncClient.notifyResumed] calls this, then catch-up only
+  /// if [UlsyncClient.live] already started. A transport with no live
+  /// session is a no-op. Does not complete the outward live stream.
   Future<void> pokeLive();
 
   /// Cancels the live stream, closes the HTTP client, rejects later calls.

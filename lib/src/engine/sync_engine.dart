@@ -3,8 +3,10 @@
 /// HTTP push and pull do not hold the mutex: a local [UlsyncClient.write]
 /// must not wait on the transport timeout. After a local edit, if
 /// [UlsyncClient.live] has already been started, the engine drains dirty
-/// itself. Work-offline mute is [UlsyncClient.live] never started: write
-/// does not push.
+/// itself. Work-offline mute is [UlsyncClient.live] never started: write,
+/// [UlsyncClient.notifyResumed], and automatic catch-up do not push or
+/// pull. Explicit [UlsyncClient.syncOnce] is the only mail while muted
+/// (first sign-in, leaving mute).
 ///
 /// A record kit (`full` plus every named part of one id) is **indivisible**
 /// and must be **complete**. Push, pull, and diff never cut that set at
@@ -179,7 +181,8 @@ final class WriteOp {
 /// - After a local [write] / [writeAll] / [markChanged], if [live] has
 ///   already been started, schedule that same catch-up. The application
 ///   does not call [syncOnce] after each edit. If [live] has not been
-///   started, push is not invoked (Work-offline mute).
+///   started, push is not invoked (Work-offline mute). [notifyResumed]
+///   does not bypass that gate: isolate wake is not mute-exit.
 /// - Restart [live] if the transport stream ends without [close].
 /// - Replay from `since=0` when the local cursor is ahead of the server,
 ///   or when metadata still names any cell of a kit (`full` or a named
@@ -194,9 +197,11 @@ final class WriteOp {
 ///   silence watchdog is asleep too. Call [notifyResumed] from
 ///   `WidgetsBindingObserver.didChangeAppLifecycleState` when the state
 ///   is `AppLifecycleState.resumed`. That API drops the stale socket
-///   **now** and catch-up-retries [syncOnce]. Listen to
-///   [SyncConnectionLost] / [SyncConnectionRestored] for the strip; do
-///   not call [syncOnce] from those events — the engine already does.
+///   **now**. Catch-up-retries [syncOnce] only if [live] already started.
+///   A muted instance (`close` + [open] without [live]) stays silent on
+///   window focus. Listen to [SyncConnectionLost] /
+///   [SyncConnectionRestored] for the strip; do not call [syncOnce] from
+///   those events — the engine already does.
 ///
 /// After the first `server_now_ms` sample, outgoing `created_at_ms` /
 /// `last_edited_at_ms` are `nowMs` plus a stored offset so last-write-wins
@@ -936,18 +941,27 @@ final class UlsyncClient {
   ///
   /// Call from `WidgetsBindingObserver.didChangeAppLifecycleState` when
   /// the state is `AppLifecycleState.resumed` (lock screen, app switcher,
-  /// laptop sleep, first frame after a killed isolate). Tests call it
-  /// when their host wakes. Do **not** call it on every [SyncEvent]; the
-  /// engine already catch-up-retries after [SyncConnectionRestored] and
-  /// after a local [write] while [live] is running.
+  /// laptop sleep, first frame after a killed isolate, macOS window
+  /// focus). Tests call it when their host wakes. Do **not** call it on
+  /// every [SyncEvent]; the engine already catch-up-retries after
+  /// [SyncConnectionRestored] and after a local [write] while [live] is
+  /// running.
   ///
-  /// Drops the current live body immediately ([SyncTransport.pokeLive]),
-  /// then runs [syncOnce] until push/pull succeed or [close]. Network
-  /// and HTTP `5xx` retry with backoff. [UlsyncUnauthorized] and other
-  /// 4xx stop the loop: the token or request is wrong.
+  /// Drops the current live body immediately ([SyncTransport.pokeLive]).
+  /// If [live] has been started, then runs [syncOnce] until push/pull
+  /// succeed or [close]. Network and HTTP `5xx` retry with backoff.
+  /// [UlsyncUnauthorized] and other 4xx stop the loop: the token or
+  /// request is wrong.
+  ///
+  /// Work-offline mute is [open] without [live]. Isolate wake must **not**
+  /// start mail in that state: focusing a muted window is not mute-exit.
+  /// Leaving mute is still explicit [syncOnce] then [live].
   Future<void> notifyResumed() async {
     _ensureOpen();
     await _transport.pokeLive();
+    if (!_liveStarted) {
+      return;
+    }
     await _catchUpUntilReachable();
   }
 
@@ -1835,7 +1849,14 @@ final class UlsyncClient {
   /// drained after that POST, not left until the next gesture.
   /// [UlsyncUnauthorized] and [UlsyncRequestRejected] stop retrying;
   /// transport and network errors keep trying.
+  ///
+  /// Mute is a hard threshold: if [live] never started, this is a no-op.
+  /// [notifyResumed], live restore, and local-edit catch-up all enter here.
+  /// Explicit [syncOnce] (sign-in, leaving mute) does not.
   Future<void> _catchUpUntilReachable() {
+    if (_closed || !_liveStarted) {
+      return Future<void>.value();
+    }
     final existing = _catchUpGate;
     if (existing != null) {
       _catchUpPending = true;

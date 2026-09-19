@@ -1,8 +1,8 @@
 # Changelog
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-18 21:12:04 +0300  
-**Version:** 22  
+**Updated:** 2026-09-19 16:38:40 +0300  
+**Version:** 23  
 **Document type:** changelog
 
 All notable changes to this project will be documented in this file.
@@ -10,6 +10,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+
+### Fixed
+
+- Work-offline mute (`open` without `live()`) is a hard threshold for
+  automatic mail. `notifyResumed` still pokes a half-open live socket,
+  but it does not run catch-up push/pull until `live()` has started.
+  macOS window focus fires `AppLifecycleState.resumed`; that must not
+  leak muted edits. Explicit `syncOnce` remains mute-exit.
 
 ### Changed
 
