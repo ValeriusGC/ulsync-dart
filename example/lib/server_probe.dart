@@ -1,12 +1,14 @@
 /// Pre-flight HTTP checks before [UlsyncClient] opens (health and whoami).
 ///
-/// Uses [HttpClient] from `dart:io` so the example does not add a package
-/// dependency. macOS acceptance runs on the desktop embedder; web builds are
-/// not the round-2 gate for this sample.
+/// Uses [HttpClient] from `dart:io`. Shared-secret install pastes that
+/// string into Access key; this file turns it into an HS256 bearer.
+/// Three-part values pass through as identity-provider JWTs.
 library;
 
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:crypto/crypto.dart';
 
 /// Result of `GET /v1/whoami` with a valid bearer token.
 final class WhoAmIResult {
@@ -71,6 +73,27 @@ Future<void> pingHealth(Uri baseUrl) async {
   }
 }
 
+/// Shared-secret mode: [accessKey] is the install string. A JWT (two dots)
+/// is already a bearer and is returned unchanged.
+String accessKeyToBearer(String accessKey) {
+  if (accessKey.split('.').length == 3) {
+    return accessKey;
+  }
+  String b64(List<int> raw) => base64Url.encode(raw).replaceAll('=', '');
+  final header = b64(utf8.encode('{"alg":"HS256","typ":"JWT"}'));
+  final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+  final payload = b64(
+    utf8.encode('{"sub":"alice","iat":$now,"exp":${now + 3600}}'),
+  );
+  final sig = b64(
+    Hmac(
+      sha256,
+      utf8.encode(accessKey),
+    ).convert(utf8.encode('$header.$payload')).bytes,
+  );
+  return '$header.$payload.$sig';
+}
+
 /// Calls `GET <baseUrl>/v1/whoami` with `Authorization: Bearer <accessKey>`.
 ///
 /// Returns [WhoAmIResult.userId] for [UlsyncClient.userScope]. HTTP 401 maps to
@@ -84,7 +107,10 @@ Future<WhoAmIResult> fetchWhoAmI({
   try {
     final response = await () async {
       final request = await client.getUrl(uri);
-      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $accessKey');
+      request.headers.set(
+        HttpHeaders.authorizationHeader,
+        'Bearer ${accessKeyToBearer(accessKey)}',
+      );
       return request.close();
     }().timeout(const Duration(seconds: 5));
     final body = await response
