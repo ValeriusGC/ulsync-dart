@@ -232,7 +232,7 @@ final class _TodosRootPageState extends State<TodosRootPage>
       origin: kUlsyncOrigin,
       userScope: _userId,
       sourceId: _deviceName,
-      tokenProvider: () async => _accessKey,
+      tokenProvider: () async => accessKeyToBearer(_accessKey),
       adapters: [
         buildTodoAdapter(journal: _journal, onChanged: _onJournalChanged),
       ],
