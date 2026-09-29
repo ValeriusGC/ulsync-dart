@@ -1,25 +1,118 @@
 # ulsync
 
 **Created:** 2026-09-01 14:25:15 +0500  
-**Updated:** 2026-09-19 16:38:40 +0300  
-**Version:** 20  
+**Updated:** 2026-09-29 08:22:00 +0300  
+**Version:** 21  
 **Document type:** readme
 
 ## What this is
 
-Entity-level last-write-wins synchronization client for Flutter applications.
-The wire format lives in the `protocol/` git submodule pointing at
-[ulsync-protocol](https://github.com/ValeriusGC/ulsync-protocol).
-This repository is named `ulsync-dart` so other language SDKs can sit beside it
-without sharing a package name.
+ulsync is a module inside the application. An edit made on the phone
+reaches your server and, from there, that person's other devices. A task
+list, a note, a done mark: the library does not care which. It does not
+read the text and does not know what a task is. The application does.
 
-## What this is not
+The server is [ulsync-server](https://github.com/ValeriusGC/ulsync-server):
+you run it on your own machine, a private store of changes, not someone
+else's cloud.
 
-- Not an identity provider — the application supplies the bearer token.
-- Not a replacement for the application's local database — the library keeps
-  its own metadata database, separate from the application's own storage.
-- Does not invent a custom merge for the application — round 1 is mechanical
-  last-write-wins on the envelope.
+```mermaid
+flowchart TB
+  subgraph phone [Phone]
+    phoneApp["Application, its own records"]
+    phoneLib[ulsync]
+    phoneApp -->|"saved and said: it changed"| phoneLib
+    phoneLib -->|"accept into its own data"| phoneApp
+  end
+
+  server["ulsync-server"]
+
+  subgraph tablet [Tablet]
+    tabletLib[ulsync]
+    tabletApp["Application, its own records"]
+    tabletLib -->|"accept into its own data"| tabletApp
+  end
+
+  phoneLib -->|"send queue"| server
+  server -->|"edits from other devices"| phoneLib
+  server -->|"feed"| tabletLib
+```
+
+A person writes in the application. The application stores the record in
+its own storage and tells the library. The library carries the change to
+the server. The server gives it to the library on the other device, and
+that library asks the application to accept the change into its own data.
+The way back is the same.
+
+The application keeps its own records and draws its own screens. The
+library file holds only bookkeeping: what already went out, which version,
+from which device. The access key comes from your login service, or from
+one shared string, the same way as on the server. The library does not
+issue keys and does not keep task titles.
+
+The server stores what was sent to it. Between the server and the
+application it is easy to forget to say "this changed", and the tablet
+stays in the past. The library takes the send queue, edits from other
+devices, retry after a dropped link, and a check that the devices have
+not quietly diverged.
+
+The application author does three things: save the record locally, tell
+the library that it changed, and accept someone else's change into the
+application's data. The "send" mark is written together with the save.
+There is no separate "remember to sync" call. Left out, the edit stays on
+one device and shows up too late.
+
+While the network is up, a title saved on the phone appears on the tablet
+by itself. There is no Sync button. When the link drops, the person keeps
+writing locally: input does not wait for the server. The library reports
+that the connection is gone, retries the send, and catches the feed when
+the server answers again. After each edit there is no "send again" call.
+
+The text, the done mark, and the trash of one record can travel as
+separate changes, and they do not wipe each other out. A full copy of the
+card does not clear a done mark that already arrived on its own. The
+application decides which properties a record has. To the library, "in
+the trash" is the same kind of property as "done". It has no permanent
+delete. The text, the done mark, and the trash of one record travel and
+are applied together: without the done mark and the trash, the row is not
+assembled.
+
+Several related edits can be marked with one command. Until that command
+finishes, the first does not leave without the rest. They go to the
+server in one request. If the network drops before the server confirms
+them, none counts as delivered: all of them are retried. That promise is
+about the path to the server. There is no single all-or-nothing write
+into both the application data and the library file.
+
+At startup the library names which product the application belongs to. A
+foreign name is refused before any exchange, so the application does not
+start writing into another program's database when the address was the
+wrong one. Once per session it compares the device, the records the
+application knows, and the versions on the server, and closes the gap
+itself. It stamps an outgoing edit with the server clock. The application
+does not call NTP and does not adjust the phone clock.
+
+If the process slept (the lock screen, another application), the library
+does not see it. The application tells the library that it is on screen
+again, otherwise a half-dead connection looks alive. Connection status on
+screen comes from the library's events. "No link" and "this window is
+silent on purpose" are different states. After sign-in the access key
+stays off the screen.
+
+This repository includes a worked example: a to-do list under `example/`.
+It is an ordinary application built on the library, with a done mark,
+trash, and moving finished items in one command. Two macOS windows are
+two devices with different names (`phone` and `tablet`). Both talk to one
+[ulsync-server](https://github.com/ValeriusGC/ulsync-server) of your own.
+How to build and open the second window is in
+[`example/README.md`](example/README.md).
+
+The repository is named `ulsync-dart` so clients in other languages can
+sit beside it. The package name is `ulsync`. The message format lives in
+the `protocol/` submodule, which points at
+[ulsync-protocol](https://github.com/ValeriusGC/ulsync-protocol). Further
+down in this file: opening a client, record kits, the product name,
+offline use, and the exchange.
 
 ## Record kits (indivisible and complete)
 
